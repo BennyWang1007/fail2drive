@@ -132,11 +132,13 @@ As an offline benchmark, users have access to the full evaluation routes and ass
 
 2. **External pretraining is allowed.** Pretraining on large-scale real-world datasets, internet-scale multimodal corpora, foundation models, or VLM/LLM backbones is permitted. Such general visual or linguistic knowledge is considered part of the model prior and not a violation of the benchmark.
 
-3. **Leaderboard entry.** We encourage users to submit final scores through the public evaluation repository via pull request in the [official Leaderboard repository](https://github.com/SimonGer/fail2drive_leaderboard). This enables consistent comparison and facilitates transparent benchmarking.
+3. **Leaderboard entry.** We encourage users to submit final scores through the public evaluation repository via pull request in the [official Leaderboard repository](https://github.com/SimonGer/fail2drive_leaderboard). This enables consistent comparison and facilitates transparent benchmarking. Find out more in the [contribution guidelines](https://github.com/SimonGer/fail2drive_leaderboard?tab=contributing-ov-file).
 
 ### SLURM Evaluation
 
 We provide tools to evaluate models on the full benchmark using a SLURM cluster. The [slurm_evaluate.py](slurm_evaluate.py) script automatically submits jobs up to a limit specified by [eval_num_jobs.txt](eval_num_jobs.txt) and monitors the evaluation. Small modifications are necessary to adapt this script to your specific cluster and model. Look for `NOTE` and `TODO` comments in the script.
+
+> **Note:** Make sure to activate the conda environment before running the script: `conda activate fail2drive`
 
 If you run into problems during evaluations, feel free to open an issue!
 

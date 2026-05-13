@@ -10,7 +10,7 @@ Designing additional scenarios increases the diversity and complexity of Fail2Dr
 
 ### 1. Fail2Drive Toolbox *(beginner-friendly)*
 
-You can create new route files and custom obstacle designs using our Toolbox and share them on the [Scenario Hub](). Route contributions are managed through the Scenario Hub rather than pull requests to the main repository.
+You can create new route files and custom obstacle designs using our Toolbox and share them on the [Scenario Hub](https://github.com/SimonGer/fail2drive_scenario_hub). Route contributions are managed through the Scenario Hub rather than pull requests to the main repository.
 
 ### 2. Custom Scenario Implementation *(advanced)*
 

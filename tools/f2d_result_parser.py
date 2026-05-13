@@ -428,9 +428,9 @@ def build_latex_row(table: pd.DataFrame, method: str, b2d_score: Optional[float]
 
     return (
         f"{method} & {b2d_value} & {base_ds:.1f} & {base_success:.1f} & {hm_base:.1f} "
-        f"& {gen_ds:.1f} \\small{{({pct_change(gen_ds, base_ds):.1f}\\%)}} "
-        f"& {gen_success:.1f} \\small{{({pct_change(gen_success, base_success):.1f}\\%)}} "
-        f"& {hm_gen:.1f} \\small{{({pct_change(hm_gen, hm_base):.1f}\\%)}}\\\\"
+        f"& {gen_ds:.1f} \\scriptsize{{({pct_change(gen_ds, base_ds):.1f}\\%)}} "
+        f"& {gen_success:.1f} \\scriptsize{{({pct_change(gen_success, base_success):.1f}\\%)}} "
+        f"& {hm_gen:.1f} \\scriptsize{{({pct_change(hm_gen, hm_base):.1f}\\%)}}\\\\"
     )
 
 
