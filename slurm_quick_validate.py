@@ -115,6 +115,7 @@ python -u leaderboard/leaderboard/leaderboard_evaluator.py \
 #     },
 ]
 
+
 def safe_name(name: str) -> str:
     """Return a name safe for paths and Slurm job names."""
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_.-")

@@ -8,7 +8,9 @@ import random
 import shutil
 
 FAIL2DRIVE_JOB_PREFIX = "Fail2Drive_"
-MAX_JOBS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval_num_jobs.txt")
+MAX_JOBS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "eval_num_jobs.txt"
+)
 RETRYABLE_STATUSES = {
     "Failed - Agent couldn't be set up",
     "Failed",
@@ -16,10 +18,13 @@ RETRYABLE_STATUSES = {
     "Failed - Agent crashed",
 }
 
+
 # You will likely have to customize this function a bit to work with your cluster partition names etc.
-# NOTE: Make sure to run this python script with the correct conda env which automatically sets the env vars. 
+# NOTE: Make sure to run this python script with the correct conda env which automatically sets the env vars.
 # If you have issues with the variables, such as WORK_DIR not being set, you can export them in the following bash file.
-def bash_file(job, cfg, carla_world_port_start, carla_streaming_port_start, carla_tm_port_start):
+def bash_file(
+    job, cfg, carla_world_port_start, carla_streaming_port_start, carla_tm_port_start
+):
     route = job["route"]
     route_id = job["route_id"]
     seed = job["seed"]
@@ -28,8 +33,8 @@ def bash_file(job, cfg, carla_world_port_start, carla_streaming_port_start, carl
     log_file = job["log_file"]
     err_file = job["err_file"]
     job_file = job["job_file"]
-    with open(job_file, 'w', encoding='utf-8') as rsh:
-            rsh.write(f'''#!/bin/bash
+    with open(job_file, "w", encoding="utf-8") as rsh:
+        rsh.write(f"""#!/bin/bash
 #SBATCH --job-name=Fail2Drive_{seed}_{route_id}
 #SBATCH --partition=devq
 #SBATCH --qos=normal
@@ -52,18 +57,45 @@ echo JOB ID $SLURM_JOB_ID
 # NOTE: You can use this in your agent to store visualization outputs
 export VIZ_PATH={viz_path}
 
-FREE_WORLD_PORT=`comm -23 <(seq {carla_world_port_start} {carla_world_port_start + 49} | sort) <(ss -Htan | awk \'{{print $4}}\' | cut -d\':\' -f2 | sort -u) | shuf | head -n 1`
+FREE_WORLD_PORT=`comm -23 \
+    <(seq {carla_world_port_start} {carla_world_port_start + 49} | sort) \
+    <(ss -Htan | awk \'{{print $4}}\' | cut -d\':\' -f2 | sort -u) \
+    | shuf | head -n 1`
 echo 'World Port:' $FREE_WORLD_PORT
 
-FREE_STREAMING_PORT=`comm -23 <(seq {carla_streaming_port_start} {carla_streaming_port_start + 49} | sort) <(ss -Htan | awk \'{{print $4}}\' | cut -d\':\' -f2 | sort -u) | shuf | head -n 1`
+FREE_STREAMING_PORT=`comm -23 \
+    <(seq {carla_streaming_port_start} {carla_streaming_port_start + 49} | sort) \
+    <(ss -Htan | awk \'{{print $4}}\' | cut -d\':\' -f2 | sort -u) \
+    | shuf | head -n 1`
 echo 'Streaming Port:' $FREE_STREAMING_PORT
 
-export TM_PORT=`comm -23 <(seq {carla_tm_port_start} {carla_tm_port_start+49} | sort) <(ss -Htan | awk '{{print $4}}' | cut -d':' -f2 | sort -u) | shuf | head -n 1`
+export TM_PORT=`comm -23 \
+    <(seq {carla_tm_port_start} {carla_tm_port_start + 49} | sort) \
+    <(ss -Htan | awk \'{{print $4}}\' | cut -d\':\' -f2 | sort -u) \
+    | shuf | head -n 1`
 echo 'TM Port:' $TM_PORT
 
 # NOTE: Changing -graphicsadapter=0 can be useful on multi-gpu systems
-{'${CARLA_ROOT}/CarlaUE4.sh -carla-rpc-port=${FREE_WORLD_PORT} -nosound -RenderOffScreen -carla-primary-port=0 -graphicsadapter=0 -carla-streaming-port=${FREE_STREAMING_PORT} &' if cfg["rgb"] else
- '${CARLA_ROOT}/CarlaUE4.sh -carla-rpc-port=${FREE_WORLD_PORT} -nosound -nullrhi -carla-primary-port=0 -carla-streaming-port=${FREE_STREAMING_PORT} &'}
+{
+    (
+        "${CARLA_ROOT}/CarlaUE4.sh "
+        "-carla-rpc-port=${FREE_WORLD_PORT} "
+        "-nosound "
+        "-RenderOffScreen "
+        "-carla-primary-port=0 "
+        "-graphicsadapter=0 "
+        "-carla-streaming-port=${FREE_STREAMING_PORT} &"
+    )
+    if cfg["rgb"]
+    else (
+        "${CARLA_ROOT}/CarlaUE4.sh "
+        "-carla-rpc-port=${FREE_WORLD_PORT} "
+        "-nosound "
+        "-nullrhi "
+        "-carla-primary-port=0 "
+        "-carla-streaming-port=${FREE_STREAMING_PORT} &"
+    )
+}
 sleep 60  # Wait for CARLA to finish starting
 
 # NOTE: --track=MAP may have to be changed according to agent track
@@ -78,18 +110,24 @@ python -u {cfg["lb_script"]} \
 --port=${{FREE_WORLD_PORT}} \
 --traffic-manager-port=${{TM_PORT}} \
 --traffic-manager-seed={seed}
-''')
+""")
+
 
 def get_running_jobs():
     try:
-        squeue_out = subprocess.check_output(
-            f'squeue --me --noheader --format "%A|%j" | grep -F "|{FAIL2DRIVE_JOB_PREFIX}" || true',
-            shell=True,
-        ).decode("utf-8").splitlines()
+        squeue_out = (
+            subprocess.check_output(
+                f'squeue --me --noheader --format "%A|%j" | grep -F "|{FAIL2DRIVE_JOB_PREFIX}" || true',
+                shell=True,
+            )
+            .decode("utf-8")
+            .splitlines()
+        )
     except (subprocess.SubprocessError, OSError) as exc:
         print(f"[warn] Failed to query running jobs from slurm: {exc}")
         return set()
     return {line.split("|", 1)[0].strip() for line in squeue_out if line.strip()}
+
 
 def _is_retryable_result(evaluation_data):
     checkpoint = evaluation_data.get("_checkpoint")
@@ -112,14 +150,18 @@ def _is_retryable_result(evaluation_data):
 
     return False
 
+
 def get_max_num_parallel_jobs():
     try:
         with open(MAX_JOBS_FILE, "r", encoding="utf-8") as f:
             max_num_parallel_jobs = int(f.read().strip())
     except (OSError, ValueError) as exc:
-        print(f"[warn] Failed to read max parallel jobs from '{MAX_JOBS_FILE}': {exc}. Falling back to 1.")
+        print(
+            f"[warn] Failed to read max parallel jobs from '{MAX_JOBS_FILE}': {exc}. Falling back to 1."
+        )
         return 1
     return max_num_parallel_jobs
+
 
 def filter_completed(jobs):
     filtered_jobs = []
@@ -129,9 +171,9 @@ def filter_completed(jobs):
 
         # If job is running we keep it in list (other function does killing)
         if "job_id" in job:
-           if job["job_id"] in running_jobs:
-              filtered_jobs.append(job)
-              continue
+            if job["job_id"] in running_jobs:
+                filtered_jobs.append(job)
+                continue
 
         # Keep failed jobs to resubmit
         result_file = job["result_file"]
@@ -153,6 +195,7 @@ def filter_completed(jobs):
         elif job["tries"] > 0:
             filtered_jobs.append(job)
     return filtered_jobs
+
 
 def kill_dead_jobs(jobs):
     running_jobs = get_running_jobs()
@@ -177,41 +220,69 @@ def kill_dead_jobs(jobs):
 
         with open(log) as f:
             lines = f.readlines()
-        if len(lines)==0:
+        if len(lines) == 0:
             continue
 
-        if any(["Watchdog exception" in line for line in lines]) or \
-            "Engine crash handling finished; re-raising signal 11 for the default handler. Good bye.\n" in lines or \
-            "[91mStopping the route, the agent has crashed:\n" in lines or \
-            "[91mError during the simulation:\n" in lines:
+        if (
+            any(["Watchdog exception" in line for line in lines])
+            or "Engine crash handling finished; re-raising signal 11 for the default handler. Good bye.\n"
+            in lines
+            or "[91mStopping the route, the agent has crashed:\n" in lines
+            or "[91mError during the simulation:\n" in lines
+        ):
 
             subprocess.Popen(f"scancel {job_id}", shell=True)
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--routes', type=str, default='fail2drive_split',
-                      help='Path to folder containing the split route files')
-    parser.add_argument('--out_root', type=str, default='results/fail2drive',
-                      help='Path where results should be stored')
-    parser.add_argument('--seeds', nargs='+', type=int, default=[1, 2, 3],
-                      help='The seeds to evaluate')
-    parser.add_argument('--retries', type=int, default=2,
-                      help='Maximum number of retries per route')
-    parser.add_argument('--lb_script', type=str,
-                      default='leaderboard/leaderboard/leaderboard_evaluator.py',
-                      help='Path to leaderboard evaluator script')
-    parser.add_argument('--agent_file', type=str, required=True,
-                      help='Path to agent entry file')
-    parser.add_argument('--agent_config', type=str, required=True,
-                      help='Path to agent config/checkpoint')
-    parser.add_argument('--no_rgb', action='store_true',
-                      help='Disable RGB rendering and run with nullrhi')
-    parser.add_argument('--no_viz', action='store_true',
-                      help='Disable VIZ_PATH output directory handling')
+    parser.add_argument(
+        "--routes",
+        type=str,
+        default="fail2drive_split",
+        help="Path to folder containing the split route files",
+    )
+    parser.add_argument(
+        "--out_root",
+        type=str,
+        default="results/fail2drive",
+        help="Path where results should be stored",
+    )
+    parser.add_argument(
+        "--seeds", nargs="+", type=int, default=[1, 2, 3], help="The seeds to evaluate"
+    )
+    parser.add_argument(
+        "--retries", type=int, default=2, help="Maximum number of retries per route"
+    )
+    parser.add_argument(
+        "--lb_script",
+        type=str,
+        default="leaderboard/leaderboard/leaderboard_evaluator.py",
+        help="Path to leaderboard evaluator script",
+    )
+    parser.add_argument(
+        "--agent_file", type=str, required=True, help="Path to agent entry file"
+    )
+    parser.add_argument(
+        "--agent_config",
+        type=str,
+        required=True,
+        help="Path to agent config/checkpoint",
+    )
+    parser.add_argument(
+        "--no_rgb",
+        action="store_true",
+        help="Disable RGB rendering and run with nullrhi",
+    )
+    parser.add_argument(
+        "--no_viz",
+        action="store_true",
+        help="Disable VIZ_PATH output directory handling",
+    )
 
     args = parser.parse_args()
 
-    routes = sorted([x for x in os.listdir(args.routes) if x[-4:]==".xml"])
+    routes = sorted([x for x in os.listdir(args.routes) if x[-4:] == ".xml"])
 
     out_root = args.out_root
     os.makedirs(out_root, exist_ok=True)
@@ -223,7 +294,7 @@ if __name__ == "__main__":
         "lb_script": args.lb_script,
         "agent_file": args.agent_file,
         "agent_config": args.agent_config,
-        "rgb": not args.no_rgb, # NOTE: If RGB is disabled here and the agent uses a camera, CARLA will crash
+        "rgb": not args.no_rgb,  # NOTE: If RGB is disabled here and the agent uses a camera, CARLA will crash
         "viz": not args.no_viz,
     }
 
@@ -239,7 +310,9 @@ if __name__ == "__main__":
 
         for route in routes:
             route_id = route.split("_")[-1][:-4]
-            route_seed = int(route_id) % 1000 + (10000 * seed) # NOTE: Fail2Drive specific, pairs are route_id%1000
+            route_seed = int(route_id) % 1000 + (
+                10000 * seed
+            )  # NOTE: Fail2Drive specific, pairs are route_id%1000
             route = os.path.join(args.routes, route)
 
             viz_path = ""
@@ -250,7 +323,7 @@ if __name__ == "__main__":
             log_file = os.path.join(base_dir, "out", f"{route_id}_out.log")
             err_file = os.path.join(base_dir, "err", f"{route_id}_err.log")
 
-            job_file = os.path.join(base_dir, "run", f'eval_{route_id}.sh')
+            job_file = os.path.join(base_dir, "run", f"eval_{route_id}.sh")
 
             job = {
                 "route": route,
@@ -261,7 +334,7 @@ if __name__ == "__main__":
                 "err_file": err_file,
                 "viz_path": viz_path,
                 "job_file": job_file,
-                "tries": retries
+                "tries": retries,
             }
 
             job_queue.append(job)
@@ -276,7 +349,7 @@ if __name__ == "__main__":
 
     # Submitting the jobs to slurm
     jobs = len(job_queue)
-    progress = tqdm(total = jobs)
+    progress = tqdm(total=jobs)
     while job_queue:
         kill_dead_jobs(job_queue)
         job_queue = filter_completed(job_queue)
@@ -311,7 +384,13 @@ if __name__ == "__main__":
             port_idx %= 200
 
             # Make bash file:
-            bash_file(job, cfg, carla_world_port_start, carla_streaming_port_start, carla_tm_port_start)
+            bash_file(
+                job,
+                cfg,
+                carla_world_port_start,
+                carla_streaming_port_start,
+                carla_tm_port_start,
+            )
 
             # submit
             if cfg["viz"]:
@@ -323,13 +402,16 @@ if __name__ == "__main__":
                 if os.path.exists(file):
                     os.remove(file)
             try:
-                job_id = subprocess.check_output(
-                    f'sbatch {job["job_file"]}', shell=True
-                ).decode('utf-8').strip().rsplit(' ', maxsplit=1)[-1]
+                job_id = (
+                    subprocess.check_output(f'sbatch {job["job_file"]}', shell=True)
+                    .decode("utf-8")
+                    .strip()
+                    .rsplit(" ", maxsplit=1)[-1]
+                )
             except (subprocess.SubprocessError, OSError) as exc:
                 print(f"[warn] Failed to submit job '{job['job_file']}': {exc}")
                 continue
-            
+
             job["job_id"] = job_id
             job["tries"] -= 1
 
