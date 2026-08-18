@@ -16,11 +16,12 @@ _ADAPTERS = {
 
 
 def adapter_names() -> tuple[str, ...]:
-  return tuple(_ADAPTERS)
+    return tuple(_ADAPTERS)
 
 
 def get_adapter(name: str):
-  try:
-    return _ADAPTERS[name]()
-  except KeyError as exc:
-    raise ValueError(f"Unknown activation steering adapter '{name}'. Options: {', '.join(adapter_names())}") from exc
+    try:
+        return _ADAPTERS[name]()
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown activation steering adapter '{name}'. Options: {', '.join(adapter_names())}") from exc
