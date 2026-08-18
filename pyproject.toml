@@ -1,0 +1,12 @@
+[tool.mypy]
+disable_error_code = ["import-untyped"]
+mypy_path = "$MYPY_CONFIG_FILE_DIR/carla_mocks, $MYPY_CONFIG_FILE_DIR/scenario_runner, $MYPY_CONFIG_FILE_DIR/leaderboard, $MYPY_CONFIG_FILE_DIR/team_code"
+
+[tool.pyright]
+extraPaths = [
+    "carla_mocks",
+    "scenario_runner",
+    "leaderboard",
+    "team_code"
+]
+ignoredDiagnostics = ["reportAttributeAccessIssue"]

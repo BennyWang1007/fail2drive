@@ -38,16 +38,16 @@ SBATCH_OPTIONS = {
 # independent Slurm job.  Keeping the full command in every entry makes it easy
 # to change agent/config/environment variables for just one test.
 TESTS = [
-#     {
-#         "name": "f2d_1020_hipad",
-#         "command": r'''LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
-# python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
-#   --agent ./team_code/hipad_f2d_agent.py \
-#   --agent-config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d" \
-#   --routes ./fail2drive_split/Generalization_CustomObstacles_1020.xml \
-#   --port "$FREE_WORLD_PORT"''',
-#     },
-{
+    #     {
+    #         "name": "f2d_1020_hipad",
+    #         "command": r'''LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
+    # python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
+    #   --agent ./team_code/hipad_f2d_agent.py \
+    #   --agent-config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d" \
+    #   --routes ./fail2drive_split/Generalization_CustomObstacles_1020.xml \
+    #   --port "$FREE_WORLD_PORT"''',
+    #     },
+    {
         "name": "f2d_tfv6",
         "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
 python -u leaderboard/leaderboard/leaderboard_evaluator.py \
@@ -59,60 +59,60 @@ python -u leaderboard/leaderboard/leaderboard_evaluator.py \
   --debug-checkpoint "$SAVE_PATH/debug.txt" \
   --port "$FREE_WORLD_PORT"''',
     },
-#     {
-#         "name": "f2d_0004_transfuser",
-#         "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
-# python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
-#   --agent ./team_code/sensor_agent.py \
-#   --agent-config ./checkpoints/tfpp \
-#   --routes ./fail2drive_split/Base_BadParking_0004.xml \
-#   --port "$FREE_WORLD_PORT"''',
-#     },
-#     {
-#         "name": "f2d_0012_transfuser",
-#         "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
-# python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
-#   --agent ./team_code/sensor_agent.py \
-#   --agent-config ./checkpoints/tfpp \
-#   --routes ./fail2drive_split/Base_ConstructionPedestrian_0012.xml \
-#   --port "$FREE_WORLD_PORT"''',
-#     },
-#     {
-#             "name": "f2d_0016_transfuser",
-#             "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
-#     python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
-#       --agent ./team_code/sensor_agent.py \
-#       --agent-config ./checkpoints/tfpp \
-#       --routes ./fail2drive_split/Base_ConstructionPermutations_0016.xml \
-#       --port "$FREE_WORLD_PORT"''',
-#         },
-#         {
-#                 "name": "f2d_0017_transfuser",
-#                 "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
-#         python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
-#           --agent ./team_code/sensor_agent.py \
-#           --agent-config ./checkpoints/tfpp \
-#           --routes ./fail2drive_split/Base_ConstructionPermutations_0017.xml \
-#           --port "$FREE_WORLD_PORT"''',
-#             },
-#     {
-#         "name": "f2d_0021_transfuser",
-#         "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
-# python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
-#   --agent ./team_code/sensor_agent.py \
-#   --agent-config ./checkpoints/tfpp \
-#   --routes ./fail2drive_split/Base_CustomObstacles_0021.xml \
-#   --port "$FREE_WORLD_PORT"''',
-#     },
-#     {
-#         "name": "f2d_0056_transfuser",
-#         "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
-# python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
-#   --agent ./team_code/sensor_agent.py \
-#   --agent-config ./checkpoints/tfpp \
-#   --routes ./fail2drive_split/Base_RightOfWay_0056.xml \
-#   --port "$FREE_WORLD_PORT"''',
-#     },
+    #     {
+    #         "name": "f2d_0004_transfuser",
+    #         "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
+    # python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
+    #   --agent ./team_code/sensor_agent.py \
+    #   --agent-config ./checkpoints/tfpp \
+    #   --routes ./fail2drive_split/Base_BadParking_0004.xml \
+    #   --port "$FREE_WORLD_PORT"''',
+    #     },
+    #     {
+    #         "name": "f2d_0012_transfuser",
+    #         "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
+    # python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
+    #   --agent ./team_code/sensor_agent.py \
+    #   --agent-config ./checkpoints/tfpp \
+    #   --routes ./fail2drive_split/Base_ConstructionPedestrian_0012.xml \
+    #   --port "$FREE_WORLD_PORT"''',
+    #     },
+    #     {
+    #             "name": "f2d_0016_transfuser",
+    #             "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
+    #     python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
+    #       --agent ./team_code/sensor_agent.py \
+    #       --agent-config ./checkpoints/tfpp \
+    #       --routes ./fail2drive_split/Base_ConstructionPermutations_0016.xml \
+    #       --port "$FREE_WORLD_PORT"''',
+    #         },
+    #         {
+    #                 "name": "f2d_0017_transfuser",
+    #                 "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
+    #         python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
+    #           --agent ./team_code/sensor_agent.py \
+    #           --agent-config ./checkpoints/tfpp \
+    #           --routes ./fail2drive_split/Base_ConstructionPermutations_0017.xml \
+    #           --port "$FREE_WORLD_PORT"''',
+    #             },
+    #     {
+    #         "name": "f2d_0021_transfuser",
+    #         "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
+    # python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
+    #   --agent ./team_code/sensor_agent.py \
+    #   --agent-config ./checkpoints/tfpp \
+    #   --routes ./fail2drive_split/Base_CustomObstacles_0021.xml \
+    #   --port "$FREE_WORLD_PORT"''',
+    #     },
+    #     {
+    #         "name": "f2d_0056_transfuser",
+    #         "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
+    # python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
+    #   --agent ./team_code/sensor_agent.py \
+    #   --agent-config ./checkpoints/tfpp \
+    #   --routes ./fail2drive_split/Base_RightOfWay_0056.xml \
+    #   --port "$FREE_WORLD_PORT"''',
+    #     },
 ]
 
 
@@ -213,7 +213,8 @@ def main() -> None:
         test_output = OUTPUT_ROOT / name
         test_output.mkdir(parents=True, exist_ok=True)
         job_file = run_dir / f"{name}.sh"
-        job_file.write_text(make_job_script(test, test_output), encoding="utf-8")
+        job_file.write_text(make_job_script(
+            test, test_output), encoding="utf-8")
         job_file.chmod(0o755)
 
         if args.dry_run:

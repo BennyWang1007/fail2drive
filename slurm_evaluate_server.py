@@ -63,7 +63,8 @@ def parse_args() -> argparse.Namespace:
             "its own Depth-TTC or Alpamayo server on the same node as CARLA."
         )
     )
-    parser.add_argument("--eval-mode", choices=("depth_ttc", "vlm"), default="depth_ttc")
+    parser.add_argument(
+        "--eval-mode", choices=("depth_ttc", "vlm"), default="depth_ttc")
     parser.add_argument("--routes", default="fail2drive_split")
     parser.add_argument("--out-root", default="results/depth_ttc_slurm")
     parser.add_argument("--seeds", nargs="+", type=int, default=[1, 2, 3])
@@ -123,7 +124,8 @@ def route_files(route_dir: Path, route_filter: str, route_limit: int) -> list[Pa
     if not routes:
         raise RuntimeError(f"No route XML files found under {route_dir}")
     route_ids = [route.stem.rsplit("_", maxsplit=1)[-1] for route in routes]
-    duplicate_ids = sorted({route_id for route_id in route_ids if route_ids.count(route_id) > 1})
+    duplicate_ids = sorted(
+        {route_id for route_id in route_ids if route_ids.count(route_id) > 1})
     if duplicate_ids:
         raise RuntimeError(
             "Route ids must be unique because result filenames use the final id; "
@@ -152,7 +154,8 @@ def result_is_complete(result_file: Path) -> bool:
     if progress[0] < progress[1]:
         return False
     return not any(
-        not isinstance(record, dict) or record.get("status") in RETRYABLE_STATUSES
+        not isinstance(record, dict) or record.get(
+            "status") in RETRYABLE_STATUSES
         for record in records
     )
 
@@ -178,7 +181,8 @@ def validate_mode_dependencies(
     env.update(extra_env)
     root = Path(env.get("ROOT", str(repo_root.parent))).expanduser()
     if args.eval_mode == "depth_ttc":
-        depth_root = Path(env.get("DEPTH_ROOT", str(root / "Depth-Anything-V2"))).expanduser()
+        depth_root = Path(env.get("DEPTH_ROOT", str(
+            root / "Depth-Anything-V2"))).expanduser()
         checkpoint = Path(
             env.get(
                 "DEPTH_CHECKPOINT",
@@ -189,9 +193,11 @@ def validate_mode_dependencies(
             )
         ).expanduser()
         if not (depth_root / "metric_depth/depth_anything_v2").is_dir():
-            raise FileNotFoundError(f"Depth Anything code not found under {depth_root}")
+            raise FileNotFoundError(
+                f"Depth Anything code not found under {depth_root}")
         if not checkpoint.is_file():
-            raise FileNotFoundError(f"Depth Anything checkpoint not found: {checkpoint}")
+            raise FileNotFoundError(
+                f"Depth Anything checkpoint not found: {checkpoint}")
         return
 
     alpamayo_root = Path(
@@ -252,7 +258,8 @@ def cancel_dead_jobs(jobs: list[EvaluationJob], running: dict[str, str]) -> None
         )
         if not any(log_has_fatal_pattern(path) for path in log_files):
             continue
-        print(f"[cancel] fatal log pattern job={job.job_id} route={job.route.name}")
+        print(
+            f"[cancel] fatal log pattern job={job.job_id} route={job.route.name}")
         subprocess.run(["scancel", str(job.job_id)], check=False)
 
 
@@ -320,7 +327,8 @@ def submission_environment(
         env["DEPTH_TTC_DEBUG_DIR"] = str(job.debug_dir)
     else:
         env["ALPAMAYO_INPUT_SAVE_DIR"] = str(job.debug_dir / "alpamayo_inputs")
-        env["ALPAMAYO_RAW_LOG_PATH"] = str(job.debug_dir / "alpamayo_raw_responses.txt")
+        env["ALPAMAYO_RAW_LOG_PATH"] = str(
+            job.debug_dir / "alpamayo_raw_responses.txt")
     return env
 
 
@@ -420,7 +428,8 @@ def main() -> int:
         try:
             running = slurm_jobs()
         except RuntimeError as exc:
-            print(f"[warn] {exc}; retrying in {args.poll_seconds:.1f}s", flush=True)
+            print(
+                f"[warn] {exc}; retrying in {args.poll_seconds:.1f}s", flush=True)
             time.sleep(args.poll_seconds)
             continue
 
@@ -461,7 +470,8 @@ def main() -> int:
                     template, args, job, route_dir, out_root, extra_env
                 )
             except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
-                print(f"[warn] submit failed route={job.route.name}: {exc}", flush=True)
+                print(
+                    f"[warn] submit failed route={job.route.name}: {exc}", flush=True)
                 continue
             job.attempts_left -= 1
             capacity -= 1
