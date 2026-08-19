@@ -3,6 +3,11 @@ from __future__ import annotations
 import math
 import os
 
+from typing import TypeAlias
+
+Trigger: TypeAlias = tuple[str, str, int | None, float]
+Latch: TypeAlias = tuple[str, int]
+
 
 def _clip01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
@@ -46,6 +51,10 @@ class ActivationPolicy:
     def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> float:
         return 0.0
 
+    def alpha_vec(self, frame) -> list[float]:
+        # TODO
+        return [self.alpha(frame, vlm_decision=None, decision_age_frames=None)]
+
 
 class FixedAfterFramePolicy(ActivationPolicy):
     def __init__(self, alpha: float, start_frame: int, end_frame: int | None = None):
@@ -86,7 +95,7 @@ class VLMPolicy(ActivationPolicy):
             os.environ.get("VLM_WEAK_BRAKE_ALPHA", 0.5))
         self.lateral_alpha = float(os.environ.get("VLM_LATERAL_ALPHA", 1.0))
 
-    def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> list[float]:
+    def alpha_vec(self, frame: int, vlm_decision=None, decision_age_frames=None) -> list[float]:
         alpha_vector = [0.0 for _ in self.ACTIONS]
         if vlm_decision is None:
             return alpha_vector
@@ -175,12 +184,12 @@ class _BaseOraclePolicy(ActivationPolicy):
         self._cooldown_until = [-1 for _ in self.ACTIONS]
         self._last_trigger_key = None
 
-    def alpha(self, frame: int) -> list[float]:
-        alpha_vector = [0.0 for _ in self.ACTIONS]
+    def alpha_vec(self, frame: int) -> list[float]:
+        alpha_vector: list[float] = [0.0 for _ in self.ACTIONS]
         if self.fixed_alpha <= 0.0:
             return alpha_vector
 
-        triggers = self._oracle_triggers()
+        triggers: list[Trigger] = self._oracle_triggers()
         selected = self._select_triggers(triggers) if triggers else []
 
         # Braking is a live safety decision, not a lane-change maneuver. Recheck it
@@ -256,12 +265,12 @@ class _BaseOraclePolicy(ActivationPolicy):
                 alpha_vector[action_index] = self.fixed_alpha
         return alpha_vector
 
-    def _oracle_triggers(self) -> list[tuple[str, str, int | None, float]]:
+    def _oracle_triggers(self) -> list[Trigger]:
         raise NotImplementedError
 
-    def _select_triggers(self, triggers: list[tuple[str, str, int | None, float]]) -> list[tuple[str, str, int | None, float]]:
+    def _select_triggers(self, triggers: list[Trigger]) -> list[Trigger]:
         if self.allow_multi_action:
-            best_by_action = {}
+            best_by_action: dict[str, Trigger] = {}
             for trigger in triggers:
                 action = trigger[0]
                 if action not in best_by_action or trigger[3] < best_by_action[action][3]:
@@ -473,7 +482,7 @@ class PDMOraclePolicy(_BaseOraclePolicy):
         self.parking_exit_clear_rear_distance = float(
             parking_exit_clear_rear_distance)
         self.general_brake = bool(general_brake)
-        self._two_way_brake_latches = set()
+        self._two_way_brake_latches: set[Latch] = set()
 
     @classmethod
     def from_env(cls) -> "PDMOraclePolicy":
@@ -541,7 +550,7 @@ class PDMOraclePolicy(_BaseOraclePolicy):
                 os.environ.get("PDM_ORACLE_GENERAL_BRAKE")),
         )
 
-    def _oracle_triggers(self) -> list[tuple[str, str, int | None, float]]:
+    def _oracle_triggers(self) -> list[Trigger]:
         try:
             from srunner.scenariomanager.carla_data_provider import CarlaDataProvider  # pylint: disable=import-outside-toplevel
         except Exception:
@@ -556,7 +565,7 @@ class PDMOraclePolicy(_BaseOraclePolicy):
 
         ego_location = ego.get_location()
         scenarios = []
-        triggers = []
+        triggers: list[Trigger] = []
         for scenario_type, scenario_data in list(getattr(CarlaDataProvider, "active_scenarios", [])):
             actor = self._first_alive_actor(scenario_data)
             if actor is None:
@@ -749,7 +758,7 @@ class PDMOraclePolicy(_BaseOraclePolicy):
         return True
 
     @staticmethod
-    def _two_way_latch_key(scenario_type: str, scenario_data, actor) -> tuple[str, int]:
+    def _two_way_latch_key(scenario_type: str, scenario_data, actor) -> Latch:
         actor_id = getattr(actor, "id", None)
         return scenario_type, int(actor_id) if actor_id is not None else id(scenario_data)
 
