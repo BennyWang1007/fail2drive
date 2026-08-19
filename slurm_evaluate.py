@@ -113,6 +113,7 @@ python -u {cfg["lb_script"]} \
 """)
 
 
+
 def get_running_jobs():
     try:
         squeue_out = (
@@ -236,49 +237,25 @@ def kill_dead_jobs(jobs):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--routes",
-        type=str,
-        default="fail2drive_split",
-        help="Path to folder containing the split route files",
-    )
-    parser.add_argument(
-        "--out_root",
-        type=str,
-        default="results/fail2drive",
-        help="Path where results should be stored",
-    )
-    parser.add_argument(
-        "--seeds", nargs="+", type=int, default=[1, 2, 3], help="The seeds to evaluate"
-    )
-    parser.add_argument(
-        "--retries", type=int, default=2, help="Maximum number of retries per route"
-    )
-    parser.add_argument(
-        "--lb_script",
-        type=str,
-        default="leaderboard/leaderboard/leaderboard_evaluator.py",
-        help="Path to leaderboard evaluator script",
-    )
-    parser.add_argument(
-        "--agent_file", type=str, required=True, help="Path to agent entry file"
-    )
-    parser.add_argument(
-        "--agent_config",
-        type=str,
-        required=True,
-        help="Path to agent config/checkpoint",
-    )
-    parser.add_argument(
-        "--no_rgb",
-        action="store_true",
-        help="Disable RGB rendering and run with nullrhi",
-    )
-    parser.add_argument(
-        "--no_viz",
-        action="store_true",
-        help="Disable VIZ_PATH output directory handling",
-    )
+    parser.add_argument('--routes', type=str, default='fail2drive_split',
+                        help='Path to folder containing the split route files')
+    parser.add_argument('--out_root', type=str, default='results/fail2drive',
+                        help='Path where results should be stored')
+    parser.add_argument('--seeds', nargs='+', type=int, default=[1, 2, 3],
+                        help='The seeds to evaluate')
+    parser.add_argument('--retries', type=int, default=2,
+                        help='Maximum number of retries per route')
+    parser.add_argument('--lb_script', type=str,
+                        default='leaderboard/leaderboard/leaderboard_evaluator.py',
+                        help='Path to leaderboard evaluator script')
+    parser.add_argument('--agent_file', type=str, required=True,
+                        help='Path to agent entry file')
+    parser.add_argument('--agent_config', type=str, required=True,
+                        help='Path to agent config/checkpoint')
+    parser.add_argument('--no_rgb', action='store_true',
+                        help='Disable RGB rendering and run with nullrhi')
+    parser.add_argument('--no_viz', action='store_true',
+                        help='Disable VIZ_PATH output directory handling')
 
     args = parser.parse_args()
 
@@ -294,7 +271,8 @@ if __name__ == "__main__":
         "lb_script": args.lb_script,
         "agent_file": args.agent_file,
         "agent_config": args.agent_config,
-        "rgb": not args.no_rgb,  # NOTE: If RGB is disabled here and the agent uses a camera, CARLA will crash
+        # NOTE: If RGB is disabled here and the agent uses a camera, CARLA will crash
+        "rgb": not args.no_rgb,
         "viz": not args.no_viz,
     }
 
@@ -310,9 +288,8 @@ if __name__ == "__main__":
 
         for route in routes:
             route_id = route.split("_")[-1][:-4]
-            route_seed = int(route_id) % 1000 + (
-                10000 * seed
-            )  # NOTE: Fail2Drive specific, pairs are route_id%1000
+            # NOTE: Fail2Drive specific, pairs are route_id%1000
+            route_seed = int(route_id) % 1000 + (10000 * seed)
             route = os.path.join(args.routes, route)
 
             viz_path = ""
@@ -409,7 +386,8 @@ if __name__ == "__main__":
                     .rsplit(" ", maxsplit=1)[-1]
                 )
             except (subprocess.SubprocessError, OSError) as exc:
-                print(f"[warn] Failed to submit job '{job['job_file']}': {exc}")
+                print(
+                    f"[warn] Failed to submit job '{job['job_file']}': {exc}")
                 continue
 
             job["job_id"] = job_id

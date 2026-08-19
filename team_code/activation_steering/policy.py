@@ -51,10 +51,6 @@ class ActivationPolicy:
     def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> float:
         return 0.0
 
-    def alpha_vec(self, frame) -> list[float]:
-        # TODO
-        return [self.alpha(frame, vlm_decision=None, decision_age_frames=None)]
-
 
 class FixedAfterFramePolicy(ActivationPolicy):
     def __init__(self, alpha: float, start_frame: int, end_frame: int | None = None):
@@ -95,7 +91,7 @@ class VLMPolicy(ActivationPolicy):
             os.environ.get("VLM_WEAK_BRAKE_ALPHA", 0.5))
         self.lateral_alpha = float(os.environ.get("VLM_LATERAL_ALPHA", 1.0))
 
-    def alpha_vec(self, frame: int, vlm_decision=None, decision_age_frames=None) -> list[float]:
+    def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> list[float]:
         alpha_vector = [0.0 for _ in self.ACTIONS]
         if vlm_decision is None:
             return alpha_vector
@@ -184,12 +180,12 @@ class _BaseOraclePolicy(ActivationPolicy):
         self._cooldown_until = [-1 for _ in self.ACTIONS]
         self._last_trigger_key = None
 
-    def alpha_vec(self, frame: int) -> list[float]:
-        alpha_vector: list[float] = [0.0 for _ in self.ACTIONS]
+    def alpha(self, frame: int) -> list[float]:
+        alpha_vector = [0.0 for _ in self.ACTIONS]
         if self.fixed_alpha <= 0.0:
             return alpha_vector
 
-        triggers: list[Trigger] = self._oracle_triggers()
+        triggers = self._oracle_triggers()
         selected = self._select_triggers(triggers) if triggers else []
 
         # Braking is a live safety decision, not a lane-change maneuver. Recheck it
