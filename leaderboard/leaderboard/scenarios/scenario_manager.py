@@ -11,6 +11,7 @@ It must not be modified and is for reference only!
 """
 
 from __future__ import print_function
+import os
 import signal
 import sys
 import time
@@ -67,6 +68,8 @@ class ScenarioManager(object):
         self.start_game_time = 0.0
         self.end_system_time = 0.0
         self.end_game_time = 0.0
+
+        self._carla_frame_count: int = 0
 
         self._watchdog = None
         self._agent_watchdog = None
@@ -155,10 +158,12 @@ class ScenarioManager(object):
         self._scenario_thread = threading.Thread(target=self.build_scenarios_loop, args=(self._debug_mode > 0, ))
         self._scenario_thread.start()
 
-        while self._running:
-            self._tick_scenario()
+        MAX_CARLA_FRAME = int(os.environ.get("MAX_CARLA_FRAME", "0"))
 
-    def _tick_scenario(self):
+        while self._running:
+            self._tick_scenario(max_carla_frame=MAX_CARLA_FRAME)
+
+    def _tick_scenario(self, max_carla_frame: int = 0):
         """
         Run next tick of scenario and the agent and tick the world.
         """
@@ -169,6 +174,7 @@ class ScenarioManager(object):
 
         if self._timestamp_last_run < timestamp.elapsed_seconds and self._running:
             self._timestamp_last_run = timestamp.elapsed_seconds
+            self._carla_frame_count += 1
 
             self._watchdog.update()
             # Update game time and actor information
@@ -224,6 +230,14 @@ class ScenarioManager(object):
             ego_trans = self.ego_vehicles[0].get_transform()
             self._spectator.set_transform(carla.Transform(ego_trans.location + carla.Location(z=70),
                                                           carla.Rotation(pitch=-90)))
+
+            if max_carla_frame > 0 and self._carla_frame_count >= max_carla_frame:
+                print(
+                    f"\n[DEBUG] Reached MAX_CARLA_FRAME={max_carla_frame}, "
+                    "stopping scenario."
+                )
+                self._running = False
+                return
 
     def get_running_status(self):
         """
