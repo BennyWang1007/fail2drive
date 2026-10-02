@@ -120,7 +120,7 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
         self._log_activation_action(control)
         return control
 
-    def _set_plan_feature_env(self)
+    def _set_plan_feature_env(self):
         if getattr(self, "save_path", None) is not None:
             os.environ["HIPAD_PLAN_FEATURE_RUN_ID"] = self.save_path.name
         os.environ["HIPAD_PLAN_FEATURE_FRAME"] = str(int(getattr(self, "step", -1)) + 1)

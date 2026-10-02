@@ -13,7 +13,6 @@ import sys
 import time
 from datetime import datetime
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / 'team_code'))
 from activation_steering.registry import get_adapter
 
 
