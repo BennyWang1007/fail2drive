@@ -33,6 +33,7 @@ def bash_file(
     log_file = job["log_file"]
     err_file = job["err_file"]
     job_file = job["job_file"]
+    env_var_cmd = cfg.get("env_var_cmd", "")
     with open(job_file, "w", encoding="utf-8") as rsh:
         rsh.write(f"""#!/bin/bash
 #SBATCH --job-name=Fail2Drive_{seed}_{route_id}
@@ -56,6 +57,12 @@ echo JOB ID $SLURM_JOB_ID
 
 # NOTE: You can use this in your agent to store visualization outputs
 export VIZ_PATH={viz_path}
+export SAVE_PATH={viz_path}
+export LEAD_CLOSED_LOOP_CONFIG="sensor_agent_creeping=true use_kalman_filter=true slower_for_stop_sign=true produce_debug_video=true produce_debug_image=false produce_input_video=false produce_input_image=false produce_frame_frequency=5"
+export BENCHMARK_ROUTE_ID="{route_id}"
+
+{env_var_cmd}
+printenv | sort
 
 FREE_WORLD_PORT=`comm -23 \
     <(seq {carla_world_port_start} {carla_world_port_start + 49} | sort) \
@@ -111,7 +118,6 @@ python -u {cfg["lb_script"]} \
 --traffic-manager-port=${{TM_PORT}} \
 --traffic-manager-seed={seed}
 """)
-
 
 
 def get_running_jobs():
@@ -256,6 +262,8 @@ if __name__ == "__main__":
                         help='Disable RGB rendering and run with nullrhi')
     parser.add_argument('--no_viz', action='store_true',
                         help='Disable VIZ_PATH output directory handling')
+    parser.add_argument('--env_var_cmd', type=str, default='',
+                        help='Command to set environment variables for the job')
 
     args = parser.parse_args()
 

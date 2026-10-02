@@ -99,6 +99,8 @@ def parse_env_overrides(items: list[str]) -> dict[str, str]:
 
 def run_route(args: argparse.Namespace, route: Path, output_root: Path, env: dict[str, str], index: int) -> int:
     route_run_id = route.stem
+    route_env = env.copy()
+    route_env['BENCHMARK_ROUTE_ID'] = route_run_id
     result_dir = output_root / 'results'
     stdout_dir = output_root / 'stdout'
     stderr_dir = output_root / 'stderr'
@@ -129,9 +131,11 @@ def run_route(args: argparse.Namespace, route: Path, output_root: Path, env: dic
             (stderr_dir / f'{route_run_id}.log').open('a', encoding='utf-8') as stderr:
         stdout.write('[create_steering_features] ' + ' '.join(command) + '\n')
         stdout.write(
-            f'[create_steering_features] NO_OTHER_VEHICLES={env.get("NO_OTHER_VEHICLES", "")}\n')
+            f'[create_steering_features] NO_OTHER_VEHICLES={route_env.get("NO_OTHER_VEHICLES", "")}\n')
+        stdout.write(
+            f'[create_steering_features] BENCHMARK_ROUTE_ID={route_env["BENCHMARK_ROUTE_ID"]}\n')
         stdout.flush()
-        return subprocess.run(command, env=env, stdout=stdout, stderr=stderr, check=False).returncode
+        return subprocess.run(command, env=route_env, stdout=stdout, stderr=stderr, check=False).returncode
 
 
 def main() -> int:

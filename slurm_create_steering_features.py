@@ -171,7 +171,8 @@ FREE_WORLD_PORT=$(free_port 10000)
 FREE_STREAMING_PORT=$(free_port 20000)
 echo "World port: $FREE_WORLD_PORT"
 echo "Streaming port: $FREE_STREAMING_PORT"
-
+BENCHMARK_ROUTE_ID=$(basename {shlex.quote(str(route))} .xml)
+echo "Benchmark route ID: $BENCHMARK_ROUTE_ID"
 CARLA_LOG={shlex.quote(str(job_output / "carla.log"))}
 "$CARLA_ROOT/CarlaUE4.sh" \\
   -carla-rpc-port="$FREE_WORLD_PORT" \\
