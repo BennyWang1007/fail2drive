@@ -7,13 +7,17 @@ import argparse
 import gzip
 import json
 from pathlib import Path
-import sys
-from typing import Iterable
+from typing import Any, Iterable
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / 'team_code'))
+# sys.path.insert(0, str(Path(__file__).resolve().parent / 'team_code'))
+from activation_steering.base import PlannerAdapter
 from activation_steering.registry import get_adapter
+
+from activation_steering.feature_collectors.base import FeatureCollector
+from activation_steering.feature_collectors.default_collector import DefaultFeatureCollector
+from activation_steering.feature_collectors.tfv6 import TFv6FeatureCollector
 
 
 ACTION_ALIASES = {
@@ -55,6 +59,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        '--model_name',
+        default=None,
+        help='Optional model name to use for feature collection. If not provided, the default collector is used.',
+    )
+    parser.add_argument(
         '--layer-name',
         '--layer_name',
         default=None,
@@ -88,6 +97,8 @@ def parse_args() -> argparse.Namespace:
         action='store_true',
         help=(
             'Use manually picked positive frames from '
+            '<collection-root>/<ActionDir>/picked_frames_<feature_name>.json when '
+            '--feature-name is set and that file exists, otherwise falling back to '
             '<collection-root>/<ActionDir>/picked_frames.json. Negative selection is unchanged.'
         ),
     )
@@ -100,6 +111,16 @@ def parse_args() -> argparse.Namespace:
             'Use only manually picked negative frames from this JSON file. '
             'The format is Dict[run_name, List[frame]], the same as picked_frames.json. '
             'Negative include/exclude patterns are still applied.'
+        ),
+    )
+    parser.add_argument(
+        '--force',
+        '--no-cache',
+        dest='force',
+        action='store_true',
+        help=(
+            'Recompute even if a cached result already exists for this exact '
+            'action/feature/layer/picked-frames combination.'
         ),
     )
     parser.add_argument('--steer-threshold', type=float, default=0.2)
@@ -170,24 +191,41 @@ def manual_action_dir_candidates(action: str) -> list[str]:
     return candidates
 
 
-def manual_positive_frame_path(
+def picked_frames_filename_candidates(feature_name: str | None) -> list[str]:
+    """Filenames to try, in priority order.
+
+    When a feature name is given, prefer a feature-specific picked-frames
+    file (e.g. picked_frames_decoder_layer4.json) so that different layers
+    of the same action can use different hand-picked frame selections.
+    Falls back to the generic picked_frames.json when no feature-specific
+    file exists.
+    """
+    names = []
+    if feature_name:
+        names.append(f'picked_frames_{feature_name}.json')
+    names.append('picked_frames.json')
+    return names
+
+
+def _find_picked_frames_path(
     collection_root: Path,
     action: str,
     include_patterns: list[str],
-) -> Path:
+    filename: str,
+) -> Path | None:
     candidates: list[Path] = []
     for dirname in manual_action_dir_candidates(action):
-        candidates.append(collection_root / dirname / 'picked_frames.json')
+        candidates.append(collection_root / dirname / filename)
 
     for pattern in include_patterns:
-        candidates.append(collection_root / pattern / 'picked_frames.json')
+        candidates.append(collection_root / pattern / filename)
 
     for path in candidates:
         if path.exists():
             return path
 
     matching_paths = []
-    for path in sorted(collection_root.glob('*/picked_frames.json')):
+    for path in sorted(collection_root.glob(f'*/{filename}')):
         match_context = f'{path.parent.name}\n{path.parent}'
         if matches_patterns(match_context, include_patterns, []):
             matching_paths.append(path)
@@ -197,12 +235,32 @@ def manual_positive_frame_path(
     if len(matching_paths) > 1:
         shown = ', '.join(str(path) for path in matching_paths)
         raise ValueError(
-            f'--manual matched multiple picked_frames.json files: {shown}. '
+            f'--manual matched multiple {filename} files: {shown}. '
             'Use a more specific --positive-include-pattern.')
 
-    searched = ', '.join(str(path) for path in candidates)
+    return None
+
+
+def manual_positive_frame_path(
+    collection_root: Path,
+    action: str,
+    include_patterns: list[str],
+    feature_name: str | None = None,
+) -> Path:
+    searched: list[str] = []
+    for filename in picked_frames_filename_candidates(feature_name):
+        path = _find_picked_frames_path(
+            collection_root, action, include_patterns, filename)
+        if path is not None:
+            return path
+        for dirname in manual_action_dir_candidates(action):
+            searched.append(str(collection_root / dirname / filename))
+        for pattern in include_patterns:
+            searched.append(str(collection_root / pattern / filename))
+
+    shown = ', '.join(searched)
     raise FileNotFoundError(
-        f'--manual expected picked frames at one of: {searched}')
+        f'--manual expected picked frames at one of: {shown}')
 
 
 def load_manual_frames(path: Path, option_name: str) -> dict[str, set[int]]:
@@ -225,9 +283,10 @@ def load_manual_positive_frames(
     collection_root: Path,
     action: str,
     include_patterns: list[str],
+    feature_name: str | None = None,
 ) -> tuple[dict[str, set[int]], Path]:
     path = manual_positive_frame_path(
-        collection_root, action, include_patterns)
+        collection_root, action, include_patterns, feature_name)
     return load_manual_frames(path, '--manual'), path
 
 
@@ -404,30 +463,176 @@ def nested_feature_path_for(
     return None
 
 
-def feature_path_for(row: dict, log_source: Path, logs_root: Path, features_root: Path, args: argparse.Namespace, adapter) -> Path:
-    path = adapter.feature_path_for(
-        row, log_source, features_root, args.model_index)
-    if path.exists():
-        return path
-
+def feature_path_for(
+    row: dict,
+    log_source: Path,
+    logs_root: Path,
+    features_root: Path,
+    args: argparse.Namespace,
+    adapter: PlannerAdapter,
+) -> Path:
     run_name = run_name_for(log_source)
     frame = int(row['frame'])
-    sibling_path = sibling_feature_path_for(
-        log_source, run_name, args.model_index, frame, args.feature_name, args.layer_name)
-    if sibling_path is not None:
-        return sibling_path
+    action: str = args.action
 
-    nested_path = nested_feature_path_for(
-        features_root, run_name, args.model_index, frame, args.feature_name, args.layer_name)
-    if nested_path is not None:
-        return nested_path
+    # 1. Direct path from log record if explicitly given and no feature_name override is requested
+    if row.get('feature_path'):
+        p = Path(row['feature_path'])
+        if p.exists():
+            return p
 
-    return path
+    # 2. Resolve via FeatureCollector path standard: <features_root>/<run_name>/<feature_name>/...
+    features_root = features_root / action_dir_name(action) / 'features'
+    run_feature_dir = features_root / run_name
+
+    feature_collector: FeatureCollector
+    if args.model_name == 'tfv6':
+        feature_collector = TFv6FeatureCollector(output_root=run_feature_dir,)
+    else:
+        feature_collector = DefaultFeatureCollector(output_root=run_feature_dir)
+
+    candidate = feature_collector.resolve_feature_path(
+        feature_dir=run_feature_dir,
+        frame_idx=frame,
+        feature_name=args.feature_name,
+        model_idx=args.model_index,
+    )
+
+    if candidate.exists():
+        return candidate
+
+    # 3. Fallback to adapter
+    print("Falling back to adapter for feature path resolution.")
+    return adapter.feature_path_for(row, log_source, features_root, args.model_index)
+
+
+def _extract_model_index_from_path(path: Path) -> int:
+    """
+    Extracts the model index from the feature path based on the expected directory structure.
+    If the model index cannot be determined, it defaults to -1.
+    Example:
+        /mnt/bapve/thome/wangyuhao/fail2drive/steering/tfv6/Normal/features/Normal_0035_route0_08_28_23_46_56/model_01/fused_features/000335.pt
+        -> 1
+    """
+    parts = path.parts
+    for _, part in enumerate(parts):
+        if part.startswith('model_'):
+            try:
+                return int(part.split('_')[1])
+            except (IndexError, ValueError):
+                return -1
+    return -1
 
 
 def default_child_or_root(root: Path, child_name: str) -> Path:
     child = root / child_name
     return child if child.exists() else root
+
+
+CACHE_FILENAME = '.process_cache.json'
+REQUIRED_OUTPUT_FILENAMES = (
+    'positive_mean.pt', 'negative_mean.pt', 'steering_vector.pt', 'summary.json',
+)
+
+
+def file_sha256(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def frames_signature(frames: dict[str, set[int]]) -> str:
+    """Order-independent content hash of a picked-frames mapping.
+
+    Used instead of (or in addition to) a file hash so that the cache
+    stays valid even if the picked_frames JSON is rewritten with the same
+    content in a different key/list order.
+    """
+    import hashlib
+    h = hashlib.sha256()
+    for run_name in sorted(frames.keys()):
+        h.update(run_name.encode('utf-8'))
+        h.update(b'\x00')
+        for frame in sorted(frames[run_name]):
+            h.update(str(frame).encode('utf-8'))
+            h.update(b',')
+        h.update(b'\x01')
+    return h.hexdigest()
+
+
+def output_dirs_for(output_dir: Path, model_count: int, feature_name: str | None) -> list[Path]:
+    dirs = []
+    for model_idx in range(model_count):
+        current = output_dir / f'model_{model_idx:02d}' if model_count > 1 else output_dir
+        if feature_name:
+            current = current / feature_name
+        dirs.append(current)
+    return dirs
+
+
+def build_run_signature(
+    args: argparse.Namespace,
+    manual_path: Path | None,
+    manual_frames: dict[str, set[int]],
+    manual_negative_path: Path | None,
+    manual_negative_frames: dict[str, set[int]] | None,
+) -> dict[str, Any]:
+    return {
+        'version': 1,
+        'adapter': args.adapter,
+        'model_name': args.model_name,
+        'action': args.action,
+        'feature_name': args.feature_name,
+        'layer_name': args.layer_name,
+        'model_index': args.model_index,
+        'max_frames_per_class': args.max_frames_per_class,
+        'flatten': args.flatten,
+        'manual': args.manual,
+        'steer_threshold': args.steer_threshold,
+        'normal_max_abs_steer': args.normal_max_abs_steer,
+        'positive_include_pattern': sorted(args.positive_include_pattern),
+        'positive_exclude_pattern': sorted(args.positive_exclude_pattern),
+        'negative_include_pattern': sorted(args.negative_include_pattern),
+        'negative_exclude_pattern': sorted(args.negative_exclude_pattern),
+        'collection_root': str(args.collection_root),
+        'logs_root': str(args.logs_root) if args.logs_root else None,
+        'features_root': str(args.features_root) if args.features_root else None,
+        'manual_positive_frames_path': str(manual_path) if manual_path else None,
+        'manual_positive_frames_content_hash': (
+            frames_signature(manual_frames) if manual_path else None
+        ),
+        'manual_positive_frames_file_hash': (
+            file_sha256(manual_path) if manual_path else None
+        ),
+        'manual_negative_frames_path': str(manual_negative_path) if manual_negative_path else None,
+        'manual_negative_frames_content_hash': (
+            frames_signature(manual_negative_frames)
+            if manual_negative_frames is not None else None
+        ),
+        'manual_negative_frames_file_hash': (
+            file_sha256(manual_negative_path) if manual_negative_path else None
+        ),
+    }
+
+
+def cache_is_fresh(current_output_dir: Path, signature: dict[str, Any]) -> bool:
+    cache_path = current_output_dir / CACHE_FILENAME
+    if not cache_path.exists():
+        return False
+    for filename in REQUIRED_OUTPUT_FILENAMES:
+        if not (current_output_dir / filename).exists():
+            return False
+    try:
+        cached = json.loads(cache_path.read_text(encoding='utf-8'))
+    except (json.JSONDecodeError, OSError):
+        return False
+    return cached == signature
+
+
+def write_cache(current_output_dir: Path, signature: dict[str, Any]) -> None:
+    cache_path = current_output_dir / CACHE_FILENAME
+    cache_path.write_text(json.dumps(signature, indent=2), encoding='utf-8')
 
 
 def add_feature(accumulator: dict, label: str, feature: torch.Tensor, max_count: int) -> bool:
@@ -555,11 +760,13 @@ def main() -> int:
         'post_process' / (args.folder_name or args.action)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    model_count: int = 3
+
     manual_path = None
     manual_frames: dict[str, set[int]] = {}
     if args.manual:
         manual_frames, manual_path = load_manual_positive_frames(
-            collection_root, args.action, args.positive_include_pattern)
+            collection_root, args.action, args.positive_include_pattern, args.feature_name)
         setattr(args, '_manual_positive_frames', manual_frames)
 
     manual_negative_path = args.manual_negative_frames
@@ -573,13 +780,29 @@ def main() -> int:
         validate_manual_frame_overlap(manual_frames, manual_negative_frames)
         setattr(args, '_manual_negative_frames', manual_negative_frames)
 
-    accumulator = {
+    signature = build_run_signature(
+        args, manual_path, manual_frames, manual_negative_path, manual_negative_frames)
+    expected_output_dirs = output_dirs_for(output_dir, model_count, args.feature_name)
+
+    if not args.force and expected_output_dirs and all(
+        cache_is_fresh(d, signature) for d in expected_output_dirs
+    ):
+        print(
+            f'Skipping (cache hit): action={args.action} feature_name={args.feature_name} '
+            f'-- picked frames and config unchanged since last run. '
+            f'Pass --force to recompute.'
+        )
+        for d in expected_output_dirs:
+            print(f'  up to date: {d}')
+        return 0
+
+    accumulators = [{
         'positive_sum': None,
         'negative_sum': None,
         'positive_count': 0,
         'negative_count': 0,
         'flatten': args.flatten,
-    }
+    } for _ in range(model_count)]
     manifest_path = output_dir / 'selected_frames.jsonl'
     missing_features = 0
     total_rows = 0
@@ -606,74 +829,97 @@ def main() -> int:
 
                 path = feature_path_for(
                     row, log_source, logs_root, features_root, args, adapter)
+
+                model_idx = _extract_model_index_from_path(path)
+                if model_idx >= model_count:
+                    raise ValueError(
+                        f"Extracted model index {model_idx} from path {path} is out of bounds (0-{model_count-1})")
+
                 if not path.exists():
                     missing_features += 1
                     continue
 
                 feature = adapter.load_feature(path)
-                if add_feature(accumulator, label, feature, args.max_frames_per_class):
-                    record = {
-                        'label': label,
-                        'action': args.action,
-                        'run_name': run_name,
-                        'frame': int(row['frame']),
-                        'feature_path': str(path),
-                        'speed': float(row.get('speed', 0.0)),
-                        'steer': float(row.get('steer', 0.0)),
-                    }
-                    record.update(adapter.manifest_extra(row))
-                    manifest.write(json.dumps(record) + '\n')
+                indices_to_add = [model_idx]  # if label == 'positive' else range(model_count)
 
-    if accumulator['positive_count'] == 0 or accumulator['negative_count'] == 0:
-        raise RuntimeError(
-            f"Need both classes, got positive={accumulator['positive_count']} "
-            f"negative={accumulator['negative_count']} missing_features={missing_features}")
+                # record: dict[str, Any] = {}
+                for idx in indices_to_add:
+                    if add_feature(accumulators[idx], label, feature, args.max_frames_per_class):
+                        record = {
+                            'label': label,
+                            'action': args.action,
+                            'run_name': run_name,
+                            'frame': int(row['frame']),
+                            'model_idx': idx,
+                            'feature_path': str(path),
+                            'speed': float(row.get('speed', 0.0)),
+                            'steer': float(row.get('steer', 0.0)),
+                        }
+                        record.update(adapter.manifest_extra(row))
+                        manifest.write(json.dumps(record) + '\n')
 
-    positive_mean = accumulator['positive_sum'] / accumulator['positive_count']
-    negative_mean = accumulator['negative_sum'] / accumulator['negative_count']
-    steering_vector = positive_mean - negative_mean
+    for model_idx in range(model_count):
+        if model_count > 1:
+            current_output_dir = output_dir / f'model_{model_idx:02d}'
+        else:
+            current_output_dir = output_dir
 
-    torch.save(positive_mean, output_dir / 'positive_mean.pt')
-    torch.save(negative_mean, output_dir / 'negative_mean.pt')
-    torch.save(steering_vector, output_dir / 'steering_vector.pt')
+        if args.feature_name:
+            current_output_dir = current_output_dir / args.feature_name
 
-    summary = {
-        'adapter': args.adapter,
-        'action': args.action,
-        'positive_label': args.action,
-        'negative_label': 'normal',
-        'positive_count': accumulator['positive_count'],
-        'negative_count': accumulator['negative_count'],
-        'total_rows': total_rows,
-        'missing_features': missing_features,
-        'flatten': args.flatten,
-        'vector_formula': 'positive_mean - negative_mean',
-        'manual_positive_frames_path': None if manual_path is None else str(manual_path),
-        'manual_positive_frame_count': (
-            0 if manual_path is None
-            else sum(len(frames) for frames in getattr(args, '_manual_positive_frames', {}).values())
-        ),
-        'manual_negative_frames_path': (
-            None if manual_negative_path is None else str(manual_negative_path)
-        ),
-        'manual_negative_frame_count': (
-            0 if manual_negative_frames is None
-            else sum(len(frames) for frames in manual_negative_frames.values())
-        ),
-        'output_files': {
-            'positive_mean': str(output_dir / 'positive_mean.pt'),
-            'negative_mean': str(output_dir / 'negative_mean.pt'),
-            'steering_vector': str(output_dir / 'steering_vector.pt'),
-            'selected_frames': str(manifest_path),
-        },
-        'args': {
-            key: str(value) if isinstance(value, Path) else value
-            for key, value in vars(args).items()
-            if not key.startswith('_')
-        },
-    }
-    (output_dir / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
-    print(json.dumps(summary, indent=2))
+        current_output_dir.mkdir(parents=True, exist_ok=True)
+
+        if accumulators[model_idx]['positive_count'] == 0 or accumulators[model_idx]['negative_count'] == 0:
+            raise RuntimeError(
+                f"Need both classes, got positive={accumulators[model_idx]['positive_count']} "
+                f"negative={accumulators[model_idx]['negative_count']} missing_features={missing_features}")
+
+        positive_mean = accumulators[model_idx]['positive_sum'] / accumulators[model_idx]['positive_count']
+        negative_mean = accumulators[model_idx]['negative_sum'] / accumulators[model_idx]['negative_count']
+        steering_vector = positive_mean - negative_mean
+
+        torch.save(positive_mean, current_output_dir / 'positive_mean.pt')
+        torch.save(negative_mean, current_output_dir / 'negative_mean.pt')
+        torch.save(steering_vector, current_output_dir / 'steering_vector.pt')
+
+        summary = {
+            'adapter': args.adapter,
+            'action': args.action,
+            'positive_label': args.action,
+            'negative_label': 'normal',
+            'positive_count': accumulators[model_idx]['positive_count'],
+            'negative_count': accumulators[model_idx]['negative_count'],
+            'total_rows': total_rows,
+            'missing_features': missing_features,
+            'flatten': args.flatten,
+            'vector_formula': 'positive_mean - negative_mean',
+            'manual_positive_frames_path': None if manual_path is None else str(manual_path),
+            'manual_positive_frame_count': (
+                0 if manual_path is None
+                else sum(len(frames) for frames in getattr(args, '_manual_positive_frames', {}).values())
+            ),
+            'manual_negative_frames_path': (
+                None if manual_negative_path is None else str(manual_negative_path)
+            ),
+            'manual_negative_frame_count': (
+                0 if manual_negative_frames is None
+                else sum(len(frames) for frames in manual_negative_frames.values())
+            ),
+            'output_files': {
+                'positive_mean': str(current_output_dir / 'positive_mean.pt'),
+                'negative_mean': str(current_output_dir / 'negative_mean.pt'),
+                'steering_vector': str(current_output_dir / 'steering_vector.pt'),
+                'selected_frames': str(manifest_path),
+            },
+            'args': {
+                key: str(value) if isinstance(value, Path) else value
+                for key, value in vars(args).items()
+                if not key.startswith('_')
+            },
+        }
+        (current_output_dir / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+        write_cache(current_output_dir, signature)
+        print(json.dumps(summary, indent=2))
     return 0
 
 
