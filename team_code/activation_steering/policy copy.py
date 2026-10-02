@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import math
 import os
+
+# from typing import TypeAlias
+
+# Trigger: TypeAlias = tuple[str, str, int | None, float]
+# Latch: TypeAlias = tuple[str, int]
+
+
 from typing import Optional, Tuple
-
-from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
-
 Trigger = Tuple[str, str, Optional[int], float]
 Latch = Tuple[str, int]
 
@@ -208,19 +212,8 @@ class _BaseOraclePolicy(ActivationPolicy):
         if self.fixed_alpha <= 0.0:
             return alpha_vector
 
-        data_provider = CarlaDataProvider()
-        ego = data_provider.get_hero_actor()
-        if ego is None or not getattr(ego, "is_alive", True):
-            print(f"[{self.__class__.__name__}] frame={frame} Ego actor is None or not alive, returning alpha_vector={alpha_vector}")
-            return alpha_vector
-
-        self._debug_both_lane_clear(ego, data_provider)  # For debugging, check both lane clearance and print debug info
-        # self._debug_current_lane_clear_distance(ego, data_provider)  # For debugging, check current lane clearance distance and print debug info
-
         triggers = self._oracle_triggers()
         selected = self._select_triggers(triggers) if triggers else []
-        if self.verbose:
-            print(f"[{self.__class__.__name__}] frame={frame} triggers={triggers}, selected={selected}")
 
         # Braking is a live safety decision, not a lane-change maneuver. Recheck it
         # every frame so an obstacle that remains in the ego path cannot fall into
@@ -270,16 +263,9 @@ class _BaseOraclePolicy(ActivationPolicy):
         for action, scenario_type, actor_id, distance in selected:
             if action == "brake":
                 continue
-
             action_index = self.ACTION_INDEX[action]
-
-            if not self._lane_clear_new(ego, action, data_provider):
-                continue
-
             if frame < self._cooldown_until[action_index]:
-                print(f"[{self.__class__.__name__}] frame={frame} < _cooldown_until[{action}]={self._cooldown_until[action_index]}, skipping lateral action")
                 continue
-
             if not self.allow_multi_action:
                 other_action = "right" if action == "left" else "left"
                 other_index = self.ACTION_INDEX[other_action]
@@ -290,88 +276,18 @@ class _BaseOraclePolicy(ActivationPolicy):
             self._cooldown_until[action_index] = self._active_until[action_index] + \
                 self.cooldown_frames
             alpha_vector[action_index] = self.fixed_alpha
-            print(f"[{self.__class__.__name__}] setting _active_until[{action}]={self._active_until[action_index]}, _cooldown_until[{action}]={self._cooldown_until[action_index]}, alpha_vector={alpha_vector}")
             self._log_trigger(frame, action, scenario_type, actor_id, distance)
-
             if not self.allow_multi_action:
                 break
 
         if any(value > 0.0 for value in alpha_vector):
-            print(f"[{self.__class__.__name__}] frame={frame} returning alpha_vector={alpha_vector} after processing triggers")
             return alpha_vector
-
-        for action in ("left", "right"):
-            if self._active_until[self.ACTION_INDEX[action]] != -1:
-                if self._lateral_hold_invalidated(ego, action, data_provider):
-                    print(f"[{self.__class__.__name__}] frame={frame} lateral hold for action={action} invalidated, clearing hold and cooldown")
-                    self._active_until[self.ACTION_INDEX[action]] = -1
-                    self._cooldown_until[self.ACTION_INDEX[action]] = -1
-                    return [0.0, 0.0, 0.0]
 
         for action in ("left", "right"):
             action_index = self.ACTION_INDEX[action]
             if frame <= self._active_until[action_index]:
-                print(f"[{self.__class__.__name__}] frame={frame} lateral hold for action={action} still active until {self._active_until[action_index]}, returning alpha_vector")
                 alpha_vector[action_index] = self.fixed_alpha
         return alpha_vector
-
-    def _lateral_hold_invalidated(self, ego, action: str, data_provider: CarlaDataProvider) -> bool:
-        """Whether a currently held lateral action should be aborted."""
-        # data_provider = CarlaDataProvider()
-        # ego = data_provider.get_hero_actor()
-        world_map = self._get_map(data_provider)
-
-        if world_map is None:
-            print(f"[{self.__class__.__name__}._lateral_hold_invalidated] World map is None")
-            return False
-
-        if ego is None or not getattr(ego, "is_alive", True):
-            print(f"[{self.__class__.__name__}._lateral_hold_invalidated] Ego actor is None or not alive")
-            return False
-
-        try:
-            ego_waypoint = world_map.get_waypoint(ego.get_location())
-        except Exception as e:
-            print(f"[{self.__class__.__name__}._lateral_hold_invalidated] Error getting ego waypoint: {e}")
-            return True
-
-        if action == "left":
-            target_lane = ego_waypoint.get_left_lane()
-        elif action == "right":
-            target_lane = ego_waypoint.get_right_lane()
-        else:
-            print(f"[{self.__class__.__name__}._lateral_hold_invalidated] Invalid action: {action}")
-            return True
-
-        if target_lane is None:
-            print(f"[{self.__class__.__name__}._lateral_hold_invalidated] Target lane is None for action: {action}")
-            return True
-
-        if not self._lane_clear(ego, target_lane, data_provider):
-            print(f"[{self.__class__.__name__}._lateral_hold_invalidated] Target lane({action}) is not clear")
-            return True
-
-        return False
-
-    def _lane_clear(self, ego, target_lane, data_provider: CarlaDataProvider) -> bool:
-        raise NotImplementedError
-
-    def _lane_clear_new(self, ego, action: str, data_provider: CarlaDataProvider) -> bool:
-        raise NotImplementedError
-
-    def _debug_both_lane_clear(self, ego, data_provider: CarlaDataProvider) -> tuple[bool, bool]:
-        raise NotImplementedError
-
-    def _debug_current_lane_clear_distance(self, ego, data_provider: CarlaDataProvider,
-                                           vehicles: list | None = None, only_front: bool = True) -> float:
-        raise NotImplementedError
-
-    @staticmethod
-    def _get_map(data_provider: CarlaDataProvider):
-        try:
-            return data_provider.get_map()
-        except Exception:
-            return None
 
     def _oracle_triggers(self) -> list[Trigger]:
         raise NotImplementedError
@@ -442,7 +358,6 @@ class _BaseOraclePolicy(ActivationPolicy):
             max(ego_forward_speed, 0.0) * self.brake_reaction_time +
             max(ego_forward_speed, 0.0)**2 / (2.0 * self.brake_deceleration) +
             self.brake_distance_margin)
-        print(f"[{self.__class__.__name__}._scenario_actor_brake_hazard] longitudinal={longitudinal:.2f}, lateral={lateral:.2f}, closing_speed={closing_speed:.2f}, ttc={ttc:.2f}, stopping_distance={stopping_distance:.2f}")
         return ttc <= self.brake_ttc_threshold or longitudinal <= stopping_distance
 
     @staticmethod
@@ -558,9 +473,7 @@ class PDMOraclePolicy(_BaseOraclePolicy):
         parking_exit_left: bool = True,
         parking_exit_distance_to_driving_lane: float = 3.0,
         parking_exit_clear_front_distance: float = 25.0,
-        parking_exit_clear_rear_distance: float = 12.0,
-        parking_exit_side_margin: float = 1.0,
-        parking_exit_rear_time_gap: float = 3.0,
+        parking_exit_clear_rear_distance: float = 8.0,
         general_brake: bool = False,
     ):
         super().__init__(
@@ -598,15 +511,8 @@ class PDMOraclePolicy(_BaseOraclePolicy):
             parking_exit_clear_front_distance)
         self.parking_exit_clear_rear_distance = float(
             parking_exit_clear_rear_distance)
-        self.parking_exit_side_margin = float(parking_exit_side_margin)
-        self.parking_exit_rear_time_gap = float(parking_exit_rear_time_gap)
         self.general_brake = bool(general_brake)
         self._two_way_brake_latches: set[Latch] = set()
-        # Set each frame the parking-exit clearance check fails, so a held left
-        # steer can be aborted instead of running to completion blindly.
-        self._parking_exit_blocked = False
-
-        print(f"[{self.__class__.__name__}] self.ACTIVE_BRAKE_SCENARIOS={self.ACTIVE_BRAKE_SCENARIOS}")
 
     @classmethod
     def from_env(cls) -> "PDMOraclePolicy":
@@ -673,23 +579,14 @@ class PDMOraclePolicy(_BaseOraclePolicy):
             parking_exit_distance_to_driving_lane=float(
                 os.environ.get("PDM_ORACLE_PARKING_EXIT_DISTANCE_TO_DRIVING_LANE", 3.0)),
             parking_exit_clear_front_distance=float(os.environ.get(
-                "PDM_ORACLE_PARKING_EXIT_CLEAR_FRONT_DISTANCE", 25.0)),
+                "PDM_ORACLE_PARKING_EXIT_CLEAR_FRONT_DISTANCE", 1.0)),
             parking_exit_clear_rear_distance=float(os.environ.get(
-                "PDM_ORACLE_PARKING_EXIT_CLEAR_REAR_DISTANCE", 0.2)),
-            parking_exit_side_margin=float(os.environ.get(
-                "PDM_ORACLE_PARKING_EXIT_SIDE_MARGIN", 1.0)),
-            parking_exit_rear_time_gap=float(os.environ.get(
-                "PDM_ORACLE_PARKING_EXIT_REAR_TIME_GAP", 3.0)),
+                "PDM_ORACLE_PARKING_EXIT_CLEAR_REAR_DISTANCE", 0.0)),
             general_brake=_strtobool(
                 os.environ.get("PDM_ORACLE_GENERAL_BRAKE")),
         )
 
-    def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> list[float]:
-        # print(f"[{self.__class__.__name__}.alpha] frame={frame}, vlm_decision={vlm_decision}, decision_age_frames={decision_age_frames}")
-        return super().alpha(frame, vlm_decision, decision_age_frames)
-
     def _oracle_triggers(self) -> list[Trigger]:
-        self._parking_exit_blocked = False
         try:
             from srunner.scenariomanager.carla_data_provider import CarlaDataProvider  # pylint: disable=import-outside-toplevel
         except Exception:
@@ -707,8 +604,6 @@ class PDMOraclePolicy(_BaseOraclePolicy):
         triggers: list[Trigger] = []
         for scenario_type, scenario_data in list(getattr(CarlaDataProvider, "active_scenarios", [])):
             actor = self._first_alive_actor(scenario_data)
-            # print(f"[{self.__class__.__name__}._oracle_triggers] scenario_type={scenario_type}, actor={actor}")
-            # print(f"[{self.__class__.__name__}._oracle_triggers] scenario_data={scenario_data}")
             if actor is None:
                 # Keep the rule tied to scenario-runner state rather than an actor's
                 # visibility: crossing actors can be spawned underground or behind a
@@ -718,7 +613,6 @@ class PDMOraclePolicy(_BaseOraclePolicy):
                 continue
             distance = self._horizontal_distance(
                 ego_location, actor.get_location())
-            print(f"[{self.__class__.__name__}._oracle_triggers] distance to actor={distance}")
             scenarios.append((distance, scenario_type, scenario_data, actor))
         scenarios.sort(key=lambda item: item[0])
 
@@ -759,9 +653,6 @@ class PDMOraclePolicy(_BaseOraclePolicy):
                             getattr(brake_actor, "id", None), distance))
         return triggers
 
-    # def _lateral_hold_invalidated(self) -> bool:
-    #     return self._parking_exit_blocked
-
     def _distance_limit_for_scenario(self, scenario_type: str) -> float:
         if scenario_type in self.ACTIVE_BRAKE_SCENARIOS:
             # Activation itself is the trigger for this rule, so do not discard it
@@ -796,23 +687,17 @@ class PDMOraclePolicy(_BaseOraclePolicy):
             direction = self._scenario_direction(scenario_data)
             latch_key = self._two_way_latch_key(
                 scenario_type, scenario_data, actor)
-            # print(f"[{self.__class__.__name__}._action_from_pdm_state] scenario_type: {scenario_type} is in TWO_WAY_LATERAL_SCENARIOS, direction: {direction}, latch_key: {latch_key}")
-            print(f"[{self.__class__.__name__}._action_from_pdm_state] _two_way_path_clear: {self._two_way_path_clear(ego, scenario_data, direction, data_provider)}")
             if self._two_way_path_clear(ego, scenario_data, direction, data_provider):
                 self._two_way_brake_latches.discard(latch_key)
-                print(f"[{self.__class__.__name__}._action_from_pdm_state] Path is clear, returning lateral action for direction: {direction} -> {self._lateral_action_from_direction(direction)}")
                 return self._lateral_action_from_direction(direction)
             if latch_key in self._two_way_brake_latches:
-                print(f"[{self.__class__.__name__}._action_from_pdm_state] Latch key {latch_key} is in _two_way_brake_latches, returning 'brake'")
                 return "brake"
-            print(f"[{self.__class__.__name__}._action_from_pdm_state] _scenario_actor_brake_hazard: {self._scenario_actor_brake_hazard(ego, actor)}")
             if self._scenario_actor_brake_hazard(ego, actor):
                 # Once braking starts for a blocked two-way detour, keep braking until
                 # the target lane is clear.  Slowing down otherwise makes the closing
                 # speed fall below the instantaneous hazard threshold and prematurely
                 # releases the brake.
                 self._two_way_brake_latches.add(latch_key)
-                print(f"[{self.__class__.__name__}._action_from_pdm_state] Adding latch key {latch_key} to _two_way_brake_latches")
                 return "brake"
             return None
 
@@ -885,32 +770,28 @@ class PDMOraclePolicy(_BaseOraclePolicy):
         ignored_ids = {getattr(actor, "id", None)
                        for actor in self._alive_actors(scenario_data)}
         ignored_ids.add(getattr(ego, "id", None))
-        # ego_location = ego.get_location()
-        # ego_forward = ego.get_transform().get_forward_vector()
+        ego_location = ego.get_location()
+        ego_forward = ego.get_transform().get_forward_vector()
 
-        # for vehicle in self._vehicle_actors(data_provider):
-        #     if getattr(vehicle, "id", None) in ignored_ids or not getattr(vehicle, "is_alive", True):
-        #         continue
-        #     try:
-        #         vehicle_waypoint = world_map.get_waypoint(
-        #             vehicle.get_location())
-        #     except Exception:
-        #         continue
-        #     if vehicle_waypoint is None:
-        #         continue
-        #     if (vehicle_waypoint.road_id, vehicle_waypoint.lane_id) not in lane_keys:
-        #         continue
+        for vehicle in self._vehicle_actors(data_provider):
+            if getattr(vehicle, "id", None) in ignored_ids or not getattr(vehicle, "is_alive", True):
+                continue
+            try:
+                vehicle_waypoint = world_map.get_waypoint(
+                    vehicle.get_location())
+            except Exception:
+                continue
+            if vehicle_waypoint is None:
+                continue
+            if (vehicle_waypoint.road_id, vehicle_waypoint.lane_id) not in lane_keys:
+                continue
 
-        #     vehicle_location = vehicle.get_location()
-        #     diff = vehicle_location - ego_location
-        #     longitudinal = diff.x * ego_forward.x + diff.y * ego_forward.y
-        #     if -5.0 <= longitudinal <= self.two_way_clear_distance:
-        #         return False
-        # return True
-
-        vehicles = self._vehicle_actors(data_provider)
-        vehicles = [v for v in vehicles if getattr(v, "id", None) not in ignored_ids and getattr(v, "is_alive", True)]
-        return self._lane_clear(ego, target_lane, data_provider, vehicles=vehicles)
+            vehicle_location = vehicle.get_location()
+            diff = vehicle_location - ego_location
+            longitudinal = diff.x * ego_forward.x + diff.y * ego_forward.y
+            if -5.0 <= longitudinal <= self.two_way_clear_distance:
+                return False
+        return True
 
     @staticmethod
     def _two_way_latch_key(scenario_type: str, scenario_data, actor) -> Latch:
@@ -1039,206 +920,28 @@ class PDMOraclePolicy(_BaseOraclePolicy):
             ego,
             target_lane,
             data_provider,
-            # front_distance=self.parking_exit_clear_front_distance,
-            # rear_distance=self.parking_exit_clear_rear_distance,
+            front_distance=self.parking_exit_clear_front_distance,
+            rear_distance=self.parking_exit_clear_rear_distance,
         ):
-            self._parking_exit_blocked = True
             return None
 
         return ("left", "GeneralParkingExitLeft", None, distance_to_driving_lane)
 
-    def _debug_both_lane_clear(self, ego, data_provider: CarlaDataProvider) -> tuple[bool, bool]:
-
+    def _lane_clear(self, ego, target_lane, data_provider, front_distance: float, rear_distance: float) -> bool:
         world_map = self._get_map(data_provider)
         if world_map is None:
-            print(f"[{self.__class__.__name__}._debug_both_lane_clear] World map is None")
-            return False, False
+            return False
 
-        ego_waypoint = world_map.get_waypoint(ego.get_location())
-        if ego_waypoint is None:
-            print(f"[{self.__class__.__name__}._debug_both_lane_clear] Ego waypoint is None")
-            return False, False
-
-        left_lane = ego_waypoint.get_left_lane()
-        right_lane = ego_waypoint.get_right_lane()
-
-        left_clear = self._lane_clear(ego, left_lane, data_provider) if left_lane is not None else None
-        right_clear = self._lane_clear(ego, right_lane, data_provider) if right_lane is not None else None
-        print(f"[{self.__class__.__name__}._debug_both_lane_clear] Left lane clear: {left_clear}, Right lane clear: {right_clear}")
-
-        return left_clear or False, right_clear or False
-
-    def _debug_current_lane_clear_distance(
-        self,
-        ego,
-        data_provider: CarlaDataProvider,
-        vehicles: list | None = None,
-        only_front: bool = True,
-    ) -> float:
-        """
-        Returns the distance to the nearest vehicle in the current lane, or
-        float('inf') if no vehicle is detected within the search distance.
-
-        距離定義與 _lane_clear 一致：沿著「車道方向」投影的中心距，再扣掉
-        兩車在該方向上的投影半長（bumper-to-bumper gap，最小為 0）。
-        only_front=True 時只看主車前方的車輛。
-        """
-        tag = f"[{self.__class__.__name__}._debug_current_lane_clear_distance]"
-
-        world_map = self._get_map(data_provider)
-        if world_map is None:
-            print(f"{tag} World map is None")
-            return float("inf")
-
-        if ego is None or not getattr(ego, "is_alive", True):
-            print(f"{tag} Ego actor is None or not alive")
-            return float("inf")
-
-        ego_waypoint = world_map.get_waypoint(ego.get_location())
-        if ego_waypoint is None:
-            print(f"{tag} Ego waypoint is None")
-            return float("inf")
-
-        # 與 _lane_clear 相同：lane-key 鏈至少要涵蓋整個 clearance window，
-        # 否則位於下一段 road segment 的車輛會被提前濾掉。
-        search_distance = max(
-            self.parking_exit_clear_front_distance,
-            self.parking_exit_clear_rear_distance,
-            self.lane_key_search_distance,
-        )
-        lane_keys = self._collect_lane_keys(ego_waypoint, search_distance)
+        lane_keys = self._collect_lane_keys(
+            target_lane, max(front_distance, rear_distance))
         if not lane_keys:
-            print(f"{tag} No lane keys collected")
-            return float("inf")
-
-        # 沿車道方向投影，而非沿 ego 方向：BadParking 的 ego 是歪斜停放的。
-        try:
-            lane_forward = ego_waypoint.transform.get_forward_vector()
-        except Exception:
-            print(f"{tag} Failed to get lane forward vector, using ego's forward vector instead")
-            lane_forward = ego.get_transform().get_forward_vector()
+            return False
 
         ego_location = ego.get_location()
         ego_forward = ego.get_transform().get_forward_vector()
         ego_id = getattr(ego, "id", None)
-        ego_half = self._projected_half_length(ego, lane_forward)
 
-        if vehicles is None:
-            vehicles = self._vehicle_actors(data_provider)
-
-        nearest_distance = float("inf")
-        nearest_vehicle_id = None
-
-        for vehicle in vehicles:
-            if getattr(vehicle, "id", None) == ego_id or not getattr(vehicle, "is_alive", True):
-                continue
-
-            vehicle_waypoint = self._get_waypoint_any(world_map, vehicle.get_location())
-            if vehicle_waypoint is None:
-                continue
-            if (vehicle_waypoint.road_id, vehicle_waypoint.lane_id) not in lane_keys:
-                continue
-
-            diff = vehicle.get_location() - ego_location
-            center_offset_lane = diff.x * lane_forward.x + diff.y * lane_forward.y
-            longitudinal_ego = diff.x * ego_forward.x + diff.y * ego_forward.y
-
-            if only_front and longitudinal_ego <= 0.0:
-                continue
-
-            vehicle_half = self._projected_half_length(vehicle, lane_forward)
-            gap = max(abs(center_offset_lane) - (ego_half + vehicle_half), 0.0)
-
-            if gap > search_distance:
-                continue
-
-            if gap < nearest_distance:
-                nearest_distance = gap
-                nearest_vehicle_id = getattr(vehicle, "id", None)
-
-        if nearest_vehicle_id is None:
-            print(f"{tag} No vehicle found in current lane within {search_distance:.2f} m")
-        else:
-            print(f"{tag} Nearest vehicle {nearest_vehicle_id} at {nearest_distance:.2f} m "
-                  f"({'front only' if only_front else 'front or rear'})")
-
-        return nearest_distance
-
-    # def _lane_clear_new(self, action: str) -> bool:
-    def _lane_clear_new(self, ego, action: str, data_provider: CarlaDataProvider) -> bool:
-        # print(f"[{self.__class__.__name__}._lane_clear_new] Checking lane clearance for action: {action}")
-        world_map = self._get_map(data_provider)
-
-        if world_map is None:
-            print(f"[{self.__class__.__name__}._lane_clear_new] World map is None")
-            return True  # TOFIX: If we can't get the map, assume lane is clear
-
-        if ego is None or not getattr(ego, "is_alive", True):
-            print(f"[{self.__class__.__name__}._lane_clear_new] Ego actor is None or not alive")
-            return True  # TOFIX: If we can't get the ego, assume lane is clear
-
-        ego_waypoint = world_map.get_waypoint(ego.get_location())
-        if ego_waypoint is None:
-            print(f"[{self.__class__.__name__}._lane_clear_new] Ego waypoint is None")
-            return True  # TOFIX: If we can't find the ego's waypoint, assume lane is clear
-        if action == "left":
-            target_lane = ego_waypoint.get_left_lane()
-        elif action == "right":
-            target_lane = ego_waypoint.get_right_lane()
-        else:
-            print(f"[{self.__class__.__name__}._lane_clear_new] Invalid action: {action}")
-            return True  # TOFIX: If the action is not left or right, assume lane is clear
-
-        # print(f"[{self.__class__.__name__}._lateral_hold_invalidated] Target lane: {target_lane}")
-        if target_lane is not None and not self._lane_clear(ego, target_lane, data_provider):
-            print(f"[{self.__class__.__name__}._lane_clear_new] Checking lane clearance for action: {action} is not clear")
-            return False
-
-        print(f"[{self.__class__.__name__}._lane_clear_new] Checking lane clearance for action: {action} is clear")
-        return True
-
-    def _lane_clear(self, ego, target_lane, data_provider: CarlaDataProvider, vehicles: list | None = None) -> bool:
-        # print(f"[{self.__class__.__name__}._lane_clear] Checking lane: {target_lane}'s clearance")
-        print(f"[{self.__class__.__name__}._lane_clear] Checking lane's clearance")
-        world_map = self._get_map(data_provider)
-        if world_map is None:
-            return False
-
-        front_distance = self.parking_exit_clear_front_distance
-        rear_distance = self.parking_exit_clear_rear_distance
-
-        # The lane-key chain has to span at least as far as the clearance window,
-        # otherwise a vehicle sitting on the next road segment is silently dropped
-        # before the longitudinal test ever runs.
-        search_distance = max(
-            front_distance, rear_distance, self.lane_key_search_distance)
-        lane_keys = self._collect_lane_keys(target_lane, search_distance)
-        if not lane_keys:
-            return False
-
-        # Project along the target lane, not the ego. In BadParking the ego is
-        # parked askew by construction, so its forward vector is skewed relative
-        # to traffic flow and a vehicle that is physically abreast projects to a
-        # nonzero longitudinal offset.
-        try:
-            lane_forward = target_lane.transform.get_forward_vector()
-        except Exception:
-            print(f"[{self.__class__.__name__}._lane_clear] Failed to get lane forward vector, using ego's forward vector instead")
-            lane_forward = ego.get_transform().get_forward_vector()
-
-        ego_location = ego.get_location()
-        ego_forward = ego.get_transform().get_forward_vector()
-        ego_id = getattr(ego, "id", None)
-        ego_half = self._projected_half_length(ego, lane_forward)
-
-        lane_same_direction = ego_forward.x * lane_forward.x + ego_forward.y * lane_forward.y > 0.0
-        print(f"[{self.__class__.__name__}._lane_clear] Ego half-length along lane: {ego_half:.2f}, lane same direction: {lane_same_direction}")
-
-        if vehicles is None:
-            vehicles = self._vehicle_actors(data_provider)
-
-        # for vehicle in self._vehicle_actors(data_provider):
-        for vehicle in vehicles:
+        for vehicle in self._vehicle_actors(data_provider):
             if getattr(vehicle, "id", None) == ego_id or not getattr(vehicle, "is_alive", True):
                 continue
             vehicle_waypoint = self._get_waypoint_any(
@@ -1250,104 +953,10 @@ class PDMOraclePolicy(_BaseOraclePolicy):
 
             vehicle_location = vehicle.get_location()
             diff = vehicle_location - ego_location
-
-            # 1. 幾何長度與重疊判定（使用 lane_forward 確保車身形狀計算準確）
-            center_offset_lane = diff.x * lane_forward.x + diff.y * lane_forward.y
-            # half_sum = ego_half + self._projected_half_length(vehicle, lane_forward)
-
-            longitudinal_ego = diff.x * ego_forward.x + diff.y * ego_forward.y
-            # gap = abs(center_offset_lane) - half_sum
-            gap = abs(center_offset_lane)
-            vehicle_half = self._projected_half_length(vehicle, lane_forward)
-            # print(f"[{self.__class__.__name__}._lane_clear] Vehicle {getattr(vehicle, 'id', None)}: center_offset_lane: {center_offset_lane:.2f}, longitudinal_ego: {longitudinal_ego:.2f}, gap: {gap:.2f}, vehicle_half: {vehicle_half:.2f}")
-
-            if lane_same_direction:
-                front_distance = ego_half + vehicle_half - 0.2
-
-            if longitudinal_ego > 0.0:
-                # 確實在主車前方
-                if gap <= front_distance:
-                    print(f"Parking exit blocked (front) at gap {gap:.2f} m")
-                    return False
-            else:
-                # 確實在主車後方
-                if gap <= rear_distance:
-                    print(f"Parking exit blocked (rear) at gap {gap:.2f} m")
-                    return False
-
-                # 確認車輛是否正在接近主車，並計算接近速度，計算lane_forward方向與ego的方向
-                vehicle_speed = self._longitudinal_speed(vehicle, lane_forward)
-                # is_closing = vehicle_speed > 0.1 and ego_forward.x * lane_forward.x + ego_forward.y * lane_forward.y > 0.0
-
-                is_closing = vehicle_speed > 0.1 and (
-                    (lane_same_direction and longitudinal_ego < 0.0) or
-                    (not lane_same_direction and longitudinal_ego > 0.0)
-                )
-
-                if not is_closing:
-                    print(f"[{self.__class__.__name__}._lane_clear] Vehicle {getattr(vehicle, 'id', None)} is not closing on ego (vehicle_speed: {vehicle_speed:.2f}, lane_same_direction: {lane_same_direction}, longitudinal_ego: {longitudinal_ego:.2f})")
-                    continue
-
-                current_lane = world_map.get_waypoint(ego.get_location())
-                if current_lane is None:
-                    print(f"[{self.__class__.__name__}._lane_clear] Current lane waypoint is None, cannot compute closing speed")
-                    continue
-
-                current_lane_forward = current_lane.transform.get_forward_vector()
-                ego_speed = self._longitudinal_speed(ego, current_lane_forward)
-
-                if lane_same_direction:
-                    closing_speed = vehicle_speed - ego_speed
-                else:
-                    closing_speed = vehicle_speed + ego_speed
-
-                # 後方車輛接近速度判斷
-                # closing_speed = self._longitudinal_speed(vehicle, lane_forward)
-                # if closing_speed > 0.1 and gap / closing_speed <= self.parking_exit_rear_time_gap:
-                #     print("Parking exit blocked (rear closing)...")
-                #     return False
-                max_time_gap = self.parking_exit_rear_time_gap  # default: 3.0
-                if lane_same_direction:
-                    max_time_gap *= 0.6  # Allow more time gap for same-direction traffic
-
-                print(f"[{self.__class__.__name__}._lane_clear] Vehicle {getattr(vehicle, 'id', None)} is closing on ego")
-                if closing_speed > 0.1 and gap / closing_speed <= self.parking_exit_rear_time_gap:
-                    print(f"Parking exit blocked (rear closing) at gap {gap:.2f} m with closing speed {closing_speed:.2f} m/s")
-                    return False
-
-        print(f"[{self.__class__.__name__}._lane_clear] Lane is clear for parking exit")
+            longitudinal = diff.x * ego_forward.x + diff.y * ego_forward.y
+            if -rear_distance <= longitudinal <= front_distance:
+                return False
         return True
-
-        #     longitudinal = diff.x * ego_forward.x + diff.y * ego_forward.y
-        #     if -rear_distance <= longitudinal <= front_distance:
-        #         return False
-        # return True
-
-    @staticmethod
-    def _projected_half_length(actor, axis) -> float:
-        """Half the actor's footprint measured along ``axis``."""
-        try:
-            extent = actor.bounding_box.extent
-        except Exception:
-            return 2.5
-        try:
-            transform = actor.get_transform()
-            actor_forward = transform.get_forward_vector()
-            actor_right = transform.get_right_vector()
-        except Exception:
-            return float(getattr(extent, "x", 2.5))
-        return (
-            abs(extent.x * (actor_forward.x * axis.x + actor_forward.y * axis.y)) +
-            abs(extent.y * (actor_right.x * axis.x + actor_right.y * axis.y))
-        )
-
-    @staticmethod
-    def _longitudinal_speed(actor, axis) -> float:
-        try:
-            velocity = actor.get_velocity()
-        except Exception:
-            return 0.0
-        return velocity.x * axis.x + velocity.y * axis.y
 
     @staticmethod
     def _get_waypoint_any(world_map, location):

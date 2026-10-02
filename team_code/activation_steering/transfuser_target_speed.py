@@ -1,4 +1,5 @@
 from __future__ import annotations
+import argparse
 
 from activation_steering.base import PlannerAdapter
 
@@ -16,7 +17,7 @@ class TransFuserTargetSpeedAdapter(PlannerAdapter):
 
     name = "transfuser_target_speed"
 
-    def add_post_process_args(self, parser) -> None:
+    def add_post_process_args(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument("--brake-threshold", type=float, default=0.5)
         parser.add_argument(
             "--brake-min-target-speed-drop",
@@ -58,7 +59,7 @@ class TransFuserTargetSpeedAdapter(PlannerAdapter):
         parser.add_argument("--normal-exclude-pattern",
                             action="append", default=[])
 
-    def add_calibration_args(self, parser) -> None:
+    def add_calibration_args(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument("--success-ratio", type=float, default=0.95)
         parser.add_argument(
             "--success-metric",

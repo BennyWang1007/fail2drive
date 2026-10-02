@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from activation_steering.base import PlannerAdapter
 from activation_steering.transfuser_target_speed import TransFuserTargetSpeedAdapter
 from activation_steering.hipad_plan import HiPADPlanAdapter
 from activation_steering.uniad_traj import UniADTrajectoryAdapter
 from activation_steering.vad_traj import VADTrajectoryAdapter
 
 
-_ADAPTERS = {
+_ADAPTERS: dict[str, type[PlannerAdapter]] = {
     TransFuserTargetSpeedAdapter.name: TransFuserTargetSpeedAdapter,
     HiPADPlanAdapter.name: HiPADPlanAdapter,
     "hipad": HiPADPlanAdapter,
@@ -19,7 +20,7 @@ def adapter_names() -> tuple[str, ...]:
     return tuple(_ADAPTERS)
 
 
-def get_adapter(name: str):
+def get_adapter(name: str) -> PlannerAdapter:
     try:
         return _ADAPTERS[name]()
     except KeyError as exc:

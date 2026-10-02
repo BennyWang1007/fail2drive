@@ -148,6 +148,8 @@ def main() -> int:
         'SAVE_PATH': str(logs_root),
         'SAVE_FUSED_FEATURES': 'True',
         'FUSED_FEATURES_PATH': str(features_root),
+        'SAVE_FEATURES': 'True',
+        'FEATURES_ROOT': str(features_root),
     })
     if args.save_visual_output:
         env['DEBUG_CHALLENGE'] = '1'
