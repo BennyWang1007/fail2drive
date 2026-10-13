@@ -47,6 +47,7 @@ class EvaluationJob:
     evaluator_stdout_file: Path
     evaluator_stderr_file: Path
     debug_dir: Path
+    viz_vehicle_dir: Path
     attempts_left: int
     job_id: str | None = None
 
@@ -100,6 +101,8 @@ def parse_args() -> argparse.Namespace:
         help="Extra environment variable inherited by every submitted job; repeatable.",
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument('--env_var_cmd', type=str, default='',
+                        help='Command to set environment variables for the job')
     return parser.parse_args()
 
 
@@ -276,6 +279,7 @@ def build_jobs(
             base / "slurm_out",
             base / "slurm_err",
             base / "debug",
+            base / "viz"
         ):
             directory.mkdir(parents=True, exist_ok=True)
         for route in routes:
@@ -291,6 +295,7 @@ def build_jobs(
                     evaluator_stdout_file=base / "out" / f"{route_id}_out.log",
                     evaluator_stderr_file=base / "err" / f"{route_id}_err.log",
                     debug_dir=base / "debug" / route_id,
+                    viz_vehicle_dir=base / "viz" / route_id,
                     attempts_left=retries,
                 )
             )
@@ -321,6 +326,10 @@ def submission_environment(
             "AGENT_CONFIG": args.agent_config,
             "EVAL_TRACK": args.track,
             "EVAL_TIMEOUT": str(args.timeout),
+            "ENV_VAR_CMD": args.env_var_cmd,
+            "BENCHMARK_ROUTE_ID": job.route_id,
+            "SAVE_PATH": str(job.viz_vehicle_dir),
+            "VIZ_PATH": str(job.viz_vehicle_dir),
         }
     )
     if args.eval_mode == "depth_ttc":

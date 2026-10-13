@@ -117,3 +117,38 @@ Quick checks:
 - If TTC is too long, inspect `trajectory_times.json` and `metadata.json -> scores -> collision_detail`. If collision `point_ego.x` is too large, metric depth is likely overestimated; if `point_ego.x` is correct but timestamps are large, the trajectory time model is wrong.
 - If TTC is always unsafe, reduce `DEPTH_TTC_CORRIDOR_MARGIN_M` or increase `DEPTH_TTC_MIN_COLLISION_POINTS`.
 - If point cloud is empty, loosen `DEPTH_TTC_MIN_HEIGHT_M`, `DEPTH_TTC_MAX_HEIGHT_M`, or depth/forward filters.
+
+## Install Depth Anything V2:
+
+```bash
+git clone --depth 1 \
+  https://github.com/DepthAnything/Depth-Anything-V2.git \
+  /path/to/Depth-Anything-V2
+
+mkdir -p /path/to/Depth-Anything-V2/metric_depth/checkpoints
+
+hf download \
+  depth-anything/Depth-Anything-V2-Metric-VKITTI-Large \
+  depth_anything_v2_metric_vkitti_vitl.pth \
+  --local-dir /path/to/Depth-Anything-V2/metric_depth/checkpoints \
+  --type model
+```
+
+
+## Server run example new
+
+```bash
+cd /mnt/bapve/thome/$USER/fail2drive
+
+export DEPTH_ROOT=/mnt/bapve/thome/$USER/Depth-Anything-V2
+export DEPTH_CHECKPOINT="$DEPTH_ROOT/metric_depth/checkpoints/depth_anything_v2_metric_vkitti_vitl.pth"
+
+CUDA_VISIBLE_DEVICES=0 python tools/depth_ttc_server.py \
+  --host 127.0.0.1 \
+  --port 8766 \
+  --device cuda:0 \
+  --depth-anything-root "$DEPTH_ROOT" \
+  --checkpoint "$DEPTH_CHECKPOINT" \
+  --encoder vitl \
+  --max-depth 80
+```

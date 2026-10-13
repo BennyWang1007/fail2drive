@@ -2,12 +2,41 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional, Tuple, Union, List
 
+import numpy as np
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
+from depth_ttc_gate import DepthTTCClient, DepthTTCDecision
 
 Trigger = Tuple[str, str, Optional[int], float]
 Latch = Tuple[str, int]
+Alpha = Optional[Union[float, List[float]]]
+# predict(alpha) -> open-loop prediction (no PID / controller side effects)
+PredictFn = Callable[[Alpha], Any]
+ImageFn = Callable[[], np.ndarray]
+
+
+@dataclass
+class PolicyDecision:
+    """What a policy hands back to the agent for one frame."""
+
+    name: str  # selected candidate name, e.g. "original" / "brake"
+    alpha: Alpha  # alpha that produced `prediction`
+    prediction: Any  # prediction of the selected candidate
+    info: Any = None  # optional extra info (e.g. Depth-TTC decision)
+
+
+def _env_true(name: str) -> bool:
+    return str(os.environ.get(name, "")).lower() in ("1", "true", "t", "yes", "y", "on")
+
+
+def depth_ttc_enabled_from_env() -> bool:
+    """Single source of truth for 'is Depth-TTC requested?' (used by agent + policy_from_env)."""
+    policy_name = os.environ.get(
+        "ACTIVATION_POLICY", os.environ.get("STEERING_POLICY", "")).lower()
+    return _env_true("DEPTH_TTC_STEERING") or policy_name in (
+        "depth_ttc", "depth-ttc", "depthttc")
 
 
 def _clip01(value: float) -> float:
@@ -47,10 +76,22 @@ def _interp(points: list[tuple[float, float]], x: float) -> float:
 
 
 class ActivationPolicy:
-    """Maps each agent frame to an activation steering alpha."""
+    """Maps each agent frame to an activation steering alpha.
 
-    def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> float | list[float]:
-        return 0.0
+    Two levels of API:
+      * ``alpha(frame)``  - what simple policies implement (one alpha per frame).
+      * ``decide(...)``   - what the agent calls. The default runs ONE forward with
+        ``alpha(frame)``. Policies that need several forwards (Depth-TTC) override it,
+        so the agent never needs to know which policy is active.
+    """
+
+    def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> Alpha:
+        return None  # None == no steering
+
+    def decide(self, frame: int, speed: float, predict: PredictFn,
+               get_image: ImageFn | None = None) -> PolicyDecision:
+        alpha = self.alpha(frame)
+        return PolicyDecision("original", alpha, predict(alpha))
 
 
 class FixedAfterFramePolicy(ActivationPolicy):
@@ -80,6 +121,191 @@ class FixedAfterFramePolicy(ActivationPolicy):
         if self.end_frame is not None and frame > self.end_frame:
             return [0.0, 0.0, 0.0]
         return self.steering_vec
+
+
+class DepthTTCPolicy(ActivationPolicy):
+    """Select an activation-steered planner candidate using Depth-TTC."""
+
+    ACTIONS = ("original", "brake", "left", "right")
+
+    def __init__(self, client: DepthTTCClient, training_config):
+        self.client = client
+        self.training_config = training_config
+        self.every_n = max(1, int(os.environ.get("DEPTH_TTC_EVERY_N", 1)))
+        self.hold_frames = max(1, int(os.environ.get("DEPTH_TTC_HOLD_FRAMES", 1)))
+        self.hold_frames_brake = max(1, int(os.environ.get("DEPTH_TTC_HOLD_FRAMES_BRAKE", 1)))
+        self.hold_frames_left = max(1, int(os.environ.get("DEPTH_TTC_HOLD_FRAMES_LEFT", 1)))
+        self.hold_frames_right = max(1, int(os.environ.get("DEPTH_TTC_HOLD_FRAMES_RIGHT", 1)))
+        self.last_score_frame: int | None = None
+        self.active_until = -1
+        self.active_candidate = "original"
+
+        self._cached_alphas = [
+            ("original", [0.0, 0.0, 0.0]),
+            ("brake", [float(os.environ.get("DEPTH_TTC_BRAKE_ALPHA", 3.0)), 0.0, 0.0]),
+            ("right", [0.0, 0.0, float(os.environ.get("DEPTH_TTC_RIGHT_ALPHA", 1.0))]),
+            ("left", [0.0, float(os.environ.get("DEPTH_TTC_LEFT_ALPHA", 1.0)), 0.0]),
+        ]
+        print(
+            "[DepthTTCPolicy] loaded; this policy owns candidate generation, "
+            "server scoring, and candidate selection",
+            flush=True,
+        )
+
+    # @staticmethod
+    def _candidate_alphas(self) -> list[tuple[str, list[float]]]:
+        return self._cached_alphas
+        return [
+            ("original", [0.0, 0.0, 0.0]),
+            ("brake", [float(os.environ.get("DEPTH_TTC_BRAKE_ALPHA", 3.0)), 0.0, 0.0]),
+            ("right", [0.0, 0.0, float(os.environ.get("DEPTH_TTC_RIGHT_ALPHA", 1.0))]),
+            ("left", [0.0, float(os.environ.get("DEPTH_TTC_LEFT_ALPHA", 1.0)), 0.0]),
+        ]
+
+    def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> Alpha:
+        """Alpha of the candidate currently being held (None when nothing is held).
+
+        Depth-TTC normally goes through decide(); this exists so alpha() is always safe to call.
+        """
+        if frame <= self.active_until and self.active_candidate in ("brake", "left", "right"):
+            return dict(self._candidate_alphas())[self.active_candidate]
+        return None
+
+    def decide(self, frame: int, speed: float, predict: PredictFn,
+               get_image: ImageFn | None = None, input_data: dict | None = None) -> PolicyDecision:
+        should_score = self.should_score(frame, speed)
+        candidates = self.candidates(frame, speed)
+        print(
+            f"[DepthTTC] frame={frame} speed={speed:.3f} score={'yes' if should_score else 'no'} "
+            f"last_score_frame={self.last_score_frame} active_candidate={self.active_candidate} "
+            f"candidates={candidates}",
+            flush=True,
+        )
+        results = {name: predict(alpha) for name, alpha in candidates}
+        alphas = dict(candidates)
+
+        selected, info = next(iter(results)), None
+        if should_score and len(results) > 1 and get_image is not None:
+            try:
+                selected, info = self.select(frame, speed, results, get_image(), input_data)
+            except Exception as exc:  # scoring server down / bad reply -> keep driving
+                print(f"[DepthTTCPolicy] frame={frame} scoring failed ({exc!r}); "
+                      "falling back to original", flush=True)
+                selected, info = "original", None
+                self._activate(frame, selected)
+        print(f"[DepthTTC] frame={frame} selected={selected} alpha={alphas[selected]} "
+              f"active_until={self.active_until}", flush=True)
+        return PolicyDecision(selected, alphas[selected], results[selected], info)
+
+    def should_score(self, frame: int, speed: float) -> bool:
+        if float(speed) < float(os.environ.get("DEPTH_TTC_MIN_SPEED_M_S", 0.0)):
+            return False
+        return (
+            self.last_score_frame is None
+            or frame - self.last_score_frame >= self.every_n
+        )
+
+    def candidates(self, frame: int, speed: float) -> list[tuple[str, list[float]]]:
+        if self.should_score(frame, speed):
+            return self._candidate_alphas()
+        candidate = self.active_candidate
+        if frame > self.active_until or candidate not in {"brake", "left", "right"}:
+            candidate = "original"
+        alpha = dict(self._candidate_alphas()).get(candidate, [0.0, 0.0, 0.0])
+        return [(candidate, alpha)]
+
+    @staticmethod
+    def _planner_candidates(candidate_results) -> dict:
+        planner_candidates = {}
+        for name, prediction in candidate_results.items():
+            checkpoints = prediction.pred_route
+            target_speed_probs = prediction.pred_target_speed_distribution
+            if checkpoints is None or target_speed_probs is None:
+                continue
+            checkpoints = checkpoints.detach().float().cpu().numpy()
+            target_speed_probs = target_speed_probs.detach().float().cpu().numpy()
+            if checkpoints.ndim == 3:
+                checkpoints = checkpoints[0]
+            target_speed_probs = target_speed_probs.reshape(-1)
+            if checkpoints.ndim != 2 or checkpoints.shape[1] < 2 or not len(target_speed_probs):
+                continue
+            planner_candidates[name] = {
+                "checkpoints": checkpoints[:, :2].tolist(),
+                "target_speed_probs": target_speed_probs.tolist(),
+            }
+        return planner_candidates
+
+    def _activate(self, frame: int, candidate: str) -> None:
+        if candidate not in {"brake", "left", "right"}:
+            self.active_candidate = "original"
+            self.active_until = frame
+            return
+        self.active_candidate = candidate
+        self.active_until = frame + getattr(self, f"hold_frames_{candidate}", self.hold_frames) - 1
+
+    def select(self, frame: int, speed: float, candidate_results, image: np.ndarray, input_data: dict | None = None) -> tuple[str, DepthTTCDecision | None]:
+        """Score candidates and return ``(selected_name, decision)``."""
+        selected = next(iter(candidate_results))
+        should_score = self.should_score(frame, speed)
+        planner_candidates = self._planner_candidates(candidate_results)
+        if should_score and len(candidate_results) > 1 and planner_candidates:
+            self.last_score_frame = frame
+            calibration = self.training_config.camera_calibration[1]
+            image_height, image_width = image.shape[:2]
+            fov = float(calibration["fov"])
+            focal_length = image_width / (2.0 * math.tan(math.radians(fov) / 2.0))
+            decision = self.client.score(
+                frame_id=frame,
+                rgb_image=image,
+                speed=speed,
+                camera={
+                    "fx": focal_length,
+                    "fy": focal_length,
+                    "cx": (image_width - 1) / 2.0,
+                    "cy": (image_height - 1) / 2.0,
+                    "fov": fov,
+                    "position": [float(value) for value in calibration["pos"]],
+                },
+                ego_extent={
+                    "x": float(self.training_config.ego_extent_x),
+                    "y": float(self.training_config.ego_extent_y),
+                },
+                planner_candidates={
+                    "candidates": planner_candidates,
+                    "target_speeds": [
+                        float(value) for value in self.training_config.target_speed_classes
+                    ],
+                    "uncertainty_weight": 1,
+                    "brake_uncertainty_threshold": 0.5,
+                },
+                # radar=input_data.get("radar", None) if input_data is not None else None
+                radar=None
+            )
+            selected = getattr(decision, "selected_trajectory", "original")
+            if selected not in candidate_results:
+                print(
+                    f"[DepthTTCPolicy] frame={frame} invalid selection {selected!r}; "
+                    "falling back to original",
+                    flush=True,
+                )
+                selected = "original"
+            self._activate(frame, selected)
+            print(
+                f"[DepthTTCPolicy] frame={frame} decision={decision} "
+                f"selected={selected} active_until={self.active_until}",
+                flush=True,
+            )
+            if selected == "break":
+                self.last_score_frame = None  # allow brake to be re-evaluated every frame
+            return selected, decision
+
+        if should_score and len(candidate_results) > 1:
+            print(
+                f"[DepthTTCPolicy] frame={frame} scoring skipped: no valid "
+                "planner candidates",
+                flush=True,
+            )
+        return selected, None
 
 
 class VLMPolicy(ActivationPolicy):
@@ -1478,12 +1704,15 @@ class NoPolicy(ActivationPolicy):
     def __init__(self):
         super().__init__()
 
-    def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> float:
-        raise NotImplementedError("NoPolicy does not implement alpha()")
-        # return super().alpha(frame, vlm_decision, decision_age_frames)
+    def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> Alpha:
+        return None
 
 
-def policy_from_env(vlm_enabled: bool = False) -> ActivationPolicy:
+def policy_from_env(
+    vlm_enabled: bool = False,
+    depth_ttc_client: DepthTTCClient | None = None,
+    training_config=None,
+) -> ActivationPolicy:
 
     if vlm_enabled:
         return VLMPolicy(
@@ -1493,6 +1722,13 @@ def policy_from_env(vlm_enabled: bool = False) -> ActivationPolicy:
 
     policy_name = os.environ.get(
         "ACTIVATION_POLICY", os.environ.get("STEERING_POLICY", "")).lower()
+
+    if depth_ttc_enabled_from_env():
+        if depth_ttc_client is None:
+            raise ValueError("Depth-TTC policy requested but no DepthTTCClient was provided")
+        if training_config is None:
+            raise ValueError("DepthTTCPolicy requires the training configuration")
+        return DepthTTCPolicy(depth_ttc_client, training_config)
 
     if policy_name == "none" or _strtobool(os.environ.get("NO_POLICY")):
         return NoPolicy()
@@ -1526,4 +1762,4 @@ def policy_from_env(vlm_enabled: bool = False) -> ActivationPolicy:
 
     if alpha > 0.0:
         return FixedAfterFramePolicy(alpha=alpha, start_frame=start_frame, end_frame=end_frame)
-    return ActivationPolicy()
+    return NoPolicy()
