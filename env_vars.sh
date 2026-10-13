@@ -1,8 +1,11 @@
 LOCAL="$(realpath "$(dirname "${BASH_SOURCE[0]}")")"
 CARLA="$LOCAL/f2d_carla"
+F2D_ROOT="$LOCAL"
 LEAD_ROOT="$LOCAL/../lead-cvpr2026"
 
-conda env config vars set F2D_ROOT=$LOCAL -n fail2drive
+conda env config vars set F2D=$F2D_ROOT -n fail2drive
+conda env config vars set F2D_ROOT=$F2D_ROOT -n fail2drive
+
 conda env config vars set LEAD_ROOT=$LOCAL/../lead-cvpr2026 -n fail2drive
 conda env config vars set LEAD_PROJECT_ROOT=$LOCAL/../lead-cvpr2026 -n fail2drive
 

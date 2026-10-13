@@ -14,6 +14,7 @@ HIP="$LOCAL/../HiP-AD"
 # conda activate fail2drive_hipad
 
 conda env config vars set F2D=$F2D -n hipad
+conda env config vars set F2D_ROOT=$F2D -n hipad
 conda env config vars set HIP=$HIP -n hipad
 conda env config vars set WORK_DIR=$LOCAL -n hipad
 conda env config vars set CARLA_ROOT=$CARLA -n hipad

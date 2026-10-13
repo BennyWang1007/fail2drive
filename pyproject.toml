@@ -8,6 +8,7 @@ extraPaths = [
     "scenario_runner",
     "leaderboard",
     "team_code",
-    "../lead-cvpr2026"
+    "../HiP-AD",
+    "../lead-cvpr2026",
 ]
 ignoredDiagnostics = ["reportAttributeAccessIssue"]
