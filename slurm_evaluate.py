@@ -6,6 +6,9 @@ import argparse
 from tqdm import tqdm
 import random
 import shutil
+import re
+import sys
+from collections import Counter
 
 FAIL2DRIVE_JOB_PREFIX = "Fail2Drive_"
 MAX_JOBS_FILE = os.path.join(
@@ -13,10 +16,14 @@ MAX_JOBS_FILE = os.path.join(
 )
 RETRYABLE_STATUSES = {
     "Failed - Agent couldn't be set up",
-    "Failed",
+    # "Failed",
     "Failed - Simulation crashed",
     "Failed - Agent crashed",
 }
+
+
+def job_name(job):
+    return f"{FAIL2DRIVE_JOB_PREFIX}{job['seed']}_{job['route_id']}"
 
 
 # You will likely have to customize this function a bit to work with your cluster partition names etc.
@@ -34,9 +41,15 @@ def bash_file(
     err_file = job["err_file"]
     job_file = job["job_file"]
     env_var_cmd = cfg.get("env_var_cmd", "")
+    render_args = (
+        '-RenderOffScreen -graphicsadapter="${CARLA_GRAPHICS_ADAPTER:-$EVALUATOR_GPU}"'
+        if cfg["rgb"]
+        else "-nullrhi"
+    )
+
     with open(job_file, "w", encoding="utf-8") as rsh:
         rsh.write(f"""#!/bin/bash
-#SBATCH --job-name=Fail2Drive_{seed}_{route_id}
+#SBATCH --job-name={job_name(job)}
 #SBATCH --partition=devq
 #SBATCH --qos=normal
 #SBATCH -o {log_file}
@@ -45,8 +58,10 @@ def bash_file(
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16gb
-#SBATCH --time=2:00:00
-#SBATCH --gres=gpu:nvidia_geforce_rtx_4090:1
+#SBATCH --time=4:00:00
+#SBATCH --gres=gpu:1
+#### SBATCH -w cp[14-15,17,20]
+#### SBATCH -C "[nvidia_geforce_rtx_3090|nvidia_geforce_rtx_3090_ti|nvidia_geforce_rtx_4080_super|nvidia_geforce_rtx_4090]"
 # NOTE: Partition and gres likely need to be updated for your cluster
 
 # NOTE: Make sure that the time limit is enough for your model to fail the route!
@@ -58,11 +73,13 @@ echo JOB ID $SLURM_JOB_ID
 # NOTE: You can use this in your agent to store visualization outputs
 export VIZ_PATH={viz_path}
 export SAVE_PATH={viz_path}
-export LEAD_CLOSED_LOOP_CONFIG="sensor_agent_creeping=true use_kalman_filter=true slower_for_stop_sign=true produce_debug_video=true produce_debug_image=false produce_input_video=false produce_input_image=false produce_frame_frequency=5"
+export VISUAL_OUTPUT_PATH={viz_path}
 export BENCHMARK_ROUTE_ID="{route_id}"
 
 {env_var_cmd}
 printenv | sort
+nvidia-smi -L
+nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used --format=csv
 
 FREE_WORLD_PORT=`comm -23 \
     <(seq {carla_world_port_start} {carla_world_port_start + 49} | sort) \
@@ -83,26 +100,22 @@ export TM_PORT=`comm -23 \
 echo 'TM Port:' $TM_PORT
 
 # NOTE: Changing -graphicsadapter=0 can be useful on multi-gpu systems
-{
-    (
-        "${CARLA_ROOT}/CarlaUE4.sh "
-        "-carla-rpc-port=${FREE_WORLD_PORT} "
-        "-nosound "
-        "-RenderOffScreen "
-        "-carla-primary-port=0 "
-        "-graphicsadapter=0 "
-        "-carla-streaming-port=${FREE_STREAMING_PORT} &"
-    )
-    if cfg["rgb"]
-    else (
-        "${CARLA_ROOT}/CarlaUE4.sh "
-        "-carla-rpc-port=${FREE_WORLD_PORT} "
-        "-nosound "
-        "-nullrhi "
-        "-carla-primary-port=0 "
-        "-carla-streaming-port=${FREE_STREAMING_PORT} &"
-    )
-}
+
+CARLA_LOG_DIR="${{TEST_OUTPUT:-{viz_path}}}/carla_log"
+mkdir -p "$CARLA_LOG_DIR"
+CARLA_LOG="$CARLA_LOG_DIR/carla_log_${{SLURM_JOB_ID:-manual}}.log"
+
+"$CARLA_ROOT/CarlaUE4.sh" \\
+    -carla-rpc-port="$FREE_WORLD_PORT" \\
+    -nosound \\
+    {render_args} \\
+    -carla-primary-port=0 \\
+    -carla-streaming-port="$FREE_STREAMING_PORT" \\
+    >"$CARLA_LOG" 2>&1 &
+
+CARLA_PID=$!
+echo "Started CARLA pid=$CARLA_PID log=$CARLA_LOG"
+
 sleep 60  # Wait for CARLA to finish starting
 
 # NOTE: --track=MAP may have to be changed according to agent track
@@ -121,41 +134,71 @@ python -u {cfg["lb_script"]} \
 
 
 def get_running_jobs():
-    try:
-        squeue_out = (
-            subprocess.check_output(
-                f'squeue --me --noheader --format "%A|%j" | grep -F "|{FAIL2DRIVE_JOB_PREFIX}" || true',
-                shell=True,
+    """{slurm job name: job id} of my jobs (running or pending) that use FAIL2DRIVE_JOB_PREFIX.
+    The only place that calls squeue. If squeue fails we retry instead of returning an empty
+    dict, because "nothing is running" would make the scheduler resubmit every route."""
+    while True:
+        try:
+            out = subprocess.check_output(
+                ["squeue", "--me", "--noheader", "--format", "%A|%j"], text=True
             )
-            .decode("utf-8")
-            .splitlines()
-        )
-    except (subprocess.SubprocessError, OSError) as exc:
-        print(f"[warn] Failed to query running jobs from slurm: {exc}")
-        return set()
-    return {line.split("|", 1)[0].strip() for line in squeue_out if line.strip()}
+            break
+        except (subprocess.SubprocessError, OSError) as exc:
+            print(f"[warn] Failed to query slurm: {exc}; retrying in 10s")
+            time.sleep(10)
+
+    running = {}
+    for line in out.splitlines():
+        job_id, _, name = line.partition("|")
+        if name.strip().startswith(FAIL2DRIVE_JOB_PREFIX):
+            running[name.strip()] = job_id.strip()
+    return running
 
 
-def _is_retryable_result(evaluation_data):
+def _summarize_result(evaluation_data):
+    """(progress, [statuses]) for display only. Never raises."""
+    try:
+        checkpoint = evaluation_data.get("_checkpoint", {})
+        progress = checkpoint.get("progress")
+        statuses = [
+            r.get("status") if isinstance(r, dict) else repr(r)
+            for r in checkpoint.get("records", [])
+        ]
+        return progress, statuses
+    except Exception:
+        return None, []
+
+
+def _retry_reason(evaluation_data):
+    """None -> result is final (do NOT rerun). str -> why it must be rerun.
+    Same rules as the old _is_retryable_result, but says *which* rule fired."""
+    if not isinstance(evaluation_data, dict):
+        return "json top level is not a dict"
     checkpoint = evaluation_data.get("_checkpoint")
     if not isinstance(checkpoint, dict):
-        return True
+        return "no _checkpoint"
 
     progress = checkpoint.get("progress")
     records = checkpoint.get("records")
     if not isinstance(progress, list) or not isinstance(records, list):
-        return True
-
-    if len(progress) < 2 or progress[0] < progress[1] or len(records) == 0:
-        return True
+        return "progress/records malformed"
+    if len(progress) < 2:
+        return f"progress too short {progress}"
+    if progress[0] < progress[1]:
+        return f"progress incomplete {progress}"
+    if len(records) == 0:
+        return "records empty"
 
     for record in records:
         if not isinstance(record, dict):
-            return True
+            return "record is not a dict"
         if record.get("status") in RETRYABLE_STATUSES:
-            return True
+            return f"status {record.get('status')!r} is in RETRYABLE_STATUSES"
+    return None
 
-    return False
+
+# def _is_retryable_result(evaluation_data):
+#     return _retry_reason(evaluation_data) is not None
 
 
 def get_max_num_parallel_jobs():
@@ -170,59 +213,113 @@ def get_max_num_parallel_jobs():
     return max_num_parallel_jobs
 
 
-def filter_completed(jobs):
+def classify_job(job, running_jobs):
+    """Single source of truth for 'does this job stay in the queue (= get run)?'.
+    Used by BOTH filter_completed() and --dry-run, so they can never disagree.
+    running_jobs is the {job name: job id} dict from get_running_jobs().
+
+    Returns (keep, label, detail):
+      RUNNING     in squeue                      -> keep, but not submitted again
+      NO_RESULT   res file does not exist        -> run
+      UNREADABLE  res file is not valid json     -> run
+      RETRY       res file exists but fails _retry_reason() -> run
+      DONE        res file is final              -> never run
+    keep is additionally gated by job["tries"] > 0, exactly like before.
+    """
+    if job_name(job) in running_jobs:
+        return True, "RUNNING", f"job_id {running_jobs[job_name(job)]} in squeue"
+
+    tries_left = job["tries"] > 0
+    result_file = job["result_file"]
+    if not os.path.exists(result_file):
+        return tries_left, "NO_RESULT", "result file missing"
+
+    try:
+        with open(result_file, "r") as f:
+            evaluation_data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        return tries_left, "UNREADABLE", f"{type(exc).__name__}: {exc}"
+
+    progress, statuses = _summarize_result(evaluation_data)
+    reason = _retry_reason(evaluation_data)
+    if reason is None:
+        return False, "DONE", f"statuses={statuses} progress={progress}"
+    return tries_left, "RETRY", f"{reason} | file has statuses={statuses} progress={progress}"
+
+
+def filter_completed(jobs, running_jobs):
     filtered_jobs = []
 
-    running_jobs = get_running_jobs()
     for job in jobs:
-
-        # If job is running we keep it in list (other function does killing)
-        if "job_id" in job:
-            if job["job_id"] in running_jobs:
-                filtered_jobs.append(job)
-                continue
-
-        # Keep failed jobs to resubmit
-        result_file = job["result_file"]
-        if os.path.exists(result_file):
-            try:
-                with open(result_file, "r") as f:
-                    evaluation_data = json.load(f)
-            except (OSError, json.JSONDecodeError) as exc:
-                print(f"[warn] Could not read '{result_file}': {exc}")
-                if job["tries"] > 0:
-                    filtered_jobs.append(job)
-                continue
-
-            need_to_resubmit = _is_retryable_result(evaluation_data)
-
-            if need_to_resubmit and job["tries"] > 0:
-                filtered_jobs.append(job)
-        # Results file doesnt exist
-        elif job["tries"] > 0:
+        keep, label, detail = classify_job(job, running_jobs)
+        if label == "UNREADABLE":
+            print(f"[warn] Could not read '{job['result_file']}': {detail}")
+        if keep:
             filtered_jobs.append(job)
     return filtered_jobs
 
 
-def kill_dead_jobs(jobs):
+def dry_run_report(job_queue, verbose=False):
+    """Print what the scheduler WOULD submit. Touches nothing (no sbatch, no rm, no file writes)."""
     running_jobs = get_running_jobs()
+
+    rows = []  # (will_submit, label, detail, job)
+    for job in job_queue:
+        keep, label, detail = classify_job(job, running_jobs)
+        # RUNNING jobs are kept in the queue but never submitted again.
+        rows.append((keep and label != "RUNNING", label, detail, job))
+
+    n_total = len(rows)
+    submit = [r for r in rows if r[0]]
+    by_label = Counter(r[1] for r in submit)
+    rerun_with_result = [r for r in submit if r[1] in ("RETRY", "UNREADABLE")]
+
+    print()
+    print("=" * 78)
+    print(f"DRY RUN  (nothing is submitted / deleted)   total jobs: {n_total}")
+    print("=" * 78)
+    print(f"would SUBMIT : {len(submit)}")
+    print(f"   never run yet (no res file)      : {by_label['NO_RESULT']}")
+    print(f"   res file EXISTS but will rerun   : {len(rerun_with_result)}   <-- check these")
+    print(f"        RETRY (rule fired)          : {by_label['RETRY']}")
+    print(f"        UNREADABLE (bad json)       : {by_label['UNREADABLE']}")
+    print(f"skip, already RUNNING/PENDING : {sum(1 for r in rows if r[1] == 'RUNNING')}")
+    print(f"skip, DONE (final result)     : {sum(1 for r in rows if r[1] == 'DONE')}")
+
+    if rerun_with_result:
+        print("\n-- why do jobs that already have a res file get rerun? --")
+        why = Counter(re.sub(r" \| file has.*", "", r[2]) for r in rerun_with_result)
+        for reason, n in why.most_common():
+            print(f"  {n:5d}  {reason}")
+
+        print("\n-- (statuses found in those res files, for the rerun jobs) --")
+        seen = Counter(re.sub(r".*\| file has ", "", r[2]) for r in rerun_with_result if r[1] == "RETRY")
+        for k, n in seen.most_common(15):
+            print(f"  {n:5d}  {k}")
+
+    print("\n-- jobs that would be submitted --")
+    for will_submit, label, detail, job in rows:
+        if will_submit:
+            print(f"  [{label:10s}] seed_dir={os.path.basename(os.path.dirname(os.path.dirname(job['result_file'])))} "
+                  f"route={job['route_id']}  {detail}")
+
+    if verbose:
+        print("\n-- jobs that would be skipped --")
+        for will_submit, label, detail, job in rows:
+            if not will_submit:
+                print(f"  [{label:10s}] seed_dir={os.path.basename(os.path.dirname(os.path.dirname(job['result_file'])))} "
+                      f"route={job['route_id']}  {detail}")
+    print()
+
+
+def kill_dead_jobs(jobs, running_jobs):
     for job in jobs:
-
-        if "job_id" in job:
-            job_id = job["job_id"]
-
-        elif os.path.exists(job["log_file"]):
-            with open(job["log_file"], "r") as f:
-                job_id = f.readline().strip().replace("JOB ID ", "")
-
-        else:
-            continue
-
-        if job_id not in running_jobs:
+        job_id = running_jobs.get(job_name(job))
+        if job_id is None:
             continue
 
         log = job["log_file"]
-        if not os.path.exists(job["log_file"]):
+        if not os.path.exists(log):
             continue
 
         with open(log) as f:
@@ -254,9 +351,9 @@ if __name__ == "__main__":
     parser.add_argument('--lb_script', type=str,
                         default='leaderboard/leaderboard/leaderboard_evaluator.py',
                         help='Path to leaderboard evaluator script')
-    parser.add_argument('--agent_file', type=str, required=True,
+    parser.add_argument('--agent_file', type=str, default=None,
                         help='Path to agent entry file')
-    parser.add_argument('--agent_config', type=str, required=True,
+    parser.add_argument('--agent_config', type=str, default=None,
                         help='Path to agent config/checkpoint')
     parser.add_argument('--no_rgb', action='store_true',
                         help='Disable RGB rendering and run with nullrhi')
@@ -264,13 +361,25 @@ if __name__ == "__main__":
                         help='Disable VIZ_PATH output directory handling')
     parser.add_argument('--env_var_cmd', type=str, default='',
                         help='Command to set environment variables for the job')
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print what would be submitted without executing sbatch")
+    parser.add_argument("--verbose", action="store_true",
+                        help="With --dry-run also list the skipped (done/running) jobs")
+    parser.add_argument("--max_rounds", type=int, default=5,
+                        help="Max passes over all routes (each pass gives every unfinished route "
+                             "--retries fresh tries). Stops earlier once everything is done.")
+    parser.add_argument("--job_prefix", type=str, default=FAIL2DRIVE_JOB_PREFIX,
+                        help="Prefix for slurm job names (default: Fail2Drive_)")
 
     args = parser.parse_args()
+    if not args.dry_run and (args.agent_file is None or args.agent_config is None):
+        parser.error("--agent_file and --agent_config are required unless --dry-run is set")
 
     routes = sorted([x for x in os.listdir(args.routes) if x[-4:] == ".xml"])
 
     out_root = args.out_root
-    os.makedirs(out_root, exist_ok=True)
+    if not args.dry_run:
+        os.makedirs(out_root, exist_ok=True)
 
     seeds = args.seeds
     retries = args.retries
@@ -283,19 +392,32 @@ if __name__ == "__main__":
         "rgb": not args.no_rgb,
         "viz": not args.no_viz,
     }
+    FAIL2DRIVE_JOB_PREFIX = args.job_prefix
+
+    # Set of route IDs currently executing to exclude from the queue
+    skip_route_ids = {
+        # "0004", "0020", "0015", "0021", "0022", "0081"
+    }
+
+    skip_existing_logs = True
+    skip_existing_logs = False  # Set to True to skip jobs with existing logs
 
     # Filling the job queue
     job_queue = []
     for seed in seeds:
 
         base_dir = os.path.join(out_root, str(seed))
-        os.makedirs(os.path.join(base_dir, "run"), exist_ok=True)
-        os.makedirs(os.path.join(base_dir, "res"), exist_ok=True)
-        os.makedirs(os.path.join(base_dir, "out"), exist_ok=True)
-        os.makedirs(os.path.join(base_dir, "err"), exist_ok=True)
+        if not args.dry_run:
+            for sub_dir in ("run", "res", "out", "err"):
+                os.makedirs(os.path.join(base_dir, sub_dir), exist_ok=True)
 
         for route in routes:
             route_id = route.split("_")[-1][:-4]
+
+            # Skip jobs that are currently running
+            if route_id in skip_route_ids:
+                continue
+
             # NOTE: Fail2Drive specific, pairs are route_id%1000
             route_seed = int(route_id) % 1000 + (10000 * seed)
             route = os.path.join(args.routes, route)
@@ -308,6 +430,9 @@ if __name__ == "__main__":
             log_file = os.path.join(base_dir, "out", f"{route_id}_out.log")
             err_file = os.path.join(base_dir, "err", f"{route_id}_err.log")
 
+            # if skip_existing_logs and os.path.exists(log_file):
+            #     continue
+
             job_file = os.path.join(base_dir, "run", f"eval_{route_id}.sh")
 
             job = {
@@ -319,10 +444,15 @@ if __name__ == "__main__":
                 "err_file": err_file,
                 "viz_path": viz_path,
                 "job_file": job_file,
+                "env_var_cmd": args.env_var_cmd,
                 "tries": retries,
             }
 
             job_queue.append(job)
+
+    if args.dry_run:
+        dry_run_report(job_queue, verbose=args.verbose)
+        sys.exit(0)
 
     carla_world_ports = list(range(10000, 20000, 50))
     carla_streaming_ports = list(range(20000, 30000, 50))
@@ -333,76 +463,86 @@ if __name__ == "__main__":
     port_idx = 0
 
     # Submitting the jobs to slurm
-    jobs = len(job_queue)
-    progress = tqdm(total=jobs)
-    while job_queue:
-        kill_dead_jobs(job_queue)
-        job_queue = filter_completed(job_queue)
-
-        progress.update(jobs - len(job_queue) - progress.n)
-
-        running_jobs = get_running_jobs()
-        max_num_parallel_jobs = get_max_num_parallel_jobs()
-
-        if len(running_jobs) >= max_num_parallel_jobs:
-            time.sleep(5)
-            continue
-
-        for job in job_queue:
-            if job["tries"] <= 0:
-                continue
-
-            if "job_id" in job and job["job_id"] in running_jobs:
-                continue
-
-            if os.path.exists(job["log_file"]):
-                with open(job["log_file"], "r") as f:
-                    job_id = f.readline().strip().replace("JOB ID ", "")
-                    if job_id in running_jobs:
-                        continue
-
-            # Need to submit this job
-            carla_world_port_start = carla_world_ports[port_idx]
-            carla_streaming_port_start = carla_streaming_ports[port_idx]
-            carla_tm_port_start = carla_tm_ports[port_idx]
-            port_idx += 1
-            port_idx %= 200
-
-            # Make bash file:
-            bash_file(
-                job,
-                cfg,
-                carla_world_port_start,
-                carla_streaming_port_start,
-                carla_tm_port_start,
-            )
-
-            # submit
-            if cfg["viz"]:
-                if os.path.exists(job["viz_path"]):
-                    shutil.rmtree(job["viz_path"])
-                os.makedirs(job["viz_path"], exist_ok=True)
-
-            for file in [job["result_file"], job["err_file"], job["log_file"]]:
-                if os.path.exists(file):
-                    os.remove(file)
-            try:
-                job_id = (
-                    subprocess.check_output(f'sbatch {job["job_file"]}', shell=True)
-                    .decode("utf-8")
-                    .strip()
-                    .rsplit(" ", maxsplit=1)[-1]
-                )
-            except (subprocess.SubprocessError, OSError) as exc:
-                print(
-                    f"[warn] Failed to submit job '{job['job_file']}': {exc}")
-                continue
-
-            job["job_id"] = job_id
-            job["tries"] -= 1
-
-            print(f'submit {job["job_file"]} {job_id}')
-            print(len(job_queue))
+    # One "round" = run the queue until it is empty. Then re-check ALL routes again:
+    # finished ones drop out, ones lost to a CARLA segfault / connection failure come back
+    # with fresh tries. Stops when every route is done (or after --max_rounds).
+    all_jobs = job_queue
+    round_idx = 0
+    while True:
+        job_queue = filter_completed([dict(job) for job in all_jobs], get_running_jobs())
+        if not job_queue:
+            print("All routes finished.")
             break
+        if round_idx >= args.max_rounds:
+            print(f"[warn] Giving up after {round_idx} rounds, still unfinished:")
+            for job in job_queue:
+                print(f"  {job_name(job)} route={job['route_id']}")
+            break
+        round_idx += 1
+        print(f"[round {round_idx}/{args.max_rounds}] {len(job_queue)} unfinished jobs")
 
-        time.sleep(2)
+        jobs = len(job_queue)
+        progress = tqdm(total=jobs)
+        while job_queue:
+            running_jobs = get_running_jobs()  # the ONLY squeue call per iteration
+            kill_dead_jobs(job_queue, running_jobs)
+            job_queue = filter_completed(job_queue, running_jobs)
+
+            progress.update(jobs - len(job_queue) - progress.n)
+
+            max_num_parallel_jobs = get_max_num_parallel_jobs()
+
+            # Fill all free slots in one pass (the old code submitted one job per squeue)
+            for job in job_queue:
+                if len(running_jobs) >= max_num_parallel_jobs:
+                    break
+
+                # Out of tries, or already in squeue (even if started by an earlier launch)
+                if job["tries"] <= 0 or job_name(job) in running_jobs:
+                    continue
+
+                # Need to submit this job
+                carla_world_port_start = carla_world_ports[port_idx]
+                carla_streaming_port_start = carla_streaming_ports[port_idx]
+                carla_tm_port_start = carla_tm_ports[port_idx]
+                port_idx += 1
+                port_idx %= 200
+
+                # Make bash file:
+                bash_file(
+                    job,
+                    cfg,
+                    carla_world_port_start,
+                    carla_streaming_port_start,
+                    carla_tm_port_start,
+                )
+
+                # submit
+                if cfg["viz"]:
+                    if os.path.exists(job["viz_path"]):
+                        shutil.rmtree(job["viz_path"])
+                    os.makedirs(job["viz_path"], exist_ok=True)
+
+                for file in [job["result_file"], job["err_file"], job["log_file"]]:
+                    if os.path.exists(file):
+                        os.remove(file)
+                try:
+                    job_id = (
+                        subprocess.check_output(f'sbatch {job["job_file"]}', shell=True)
+                        .decode("utf-8")
+                        .strip()
+                        .rsplit(" ", maxsplit=1)[-1]
+                    )
+                except (subprocess.SubprocessError, OSError) as exc:
+                    print(
+                        f"[warn] Failed to submit job '{job['job_file']}': {exc}")
+                    continue
+
+                running_jobs[job_name(job)] = job_id
+                job["tries"] -= 1
+
+                print(f'submit {job["job_file"]} {job_id}')
+                print(f'Job queue size: {len(job_queue)}')
+
+            time.sleep(15)
+        progress.close()
