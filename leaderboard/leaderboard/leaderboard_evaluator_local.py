@@ -170,7 +170,8 @@ class LeaderboardEvaluator(object):
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
             try:
-                s.bind(('localhost', port))
+                # s.bind(('localhost', port))
+                s.bind(('', port))  # all interfaces, no SO_REUSEADDR# all interfaces, no SO_REUSEADDR
                 return port
             except OSError as e: # Address already in use or Address already in use (WinError)
                 pass
@@ -196,7 +197,10 @@ class LeaderboardEvaluator(object):
         )
         client.get_world().apply_settings(settings)
 
-        traffic_manager_port = self.find_free_port()
+        if args.traffic_manager_port:
+            traffic_manager_port = args.traffic_manager_port
+        else:
+            traffic_manager_port = self.find_free_port()
         traffic_manager = client.get_trafficmanager(traffic_manager_port)
         traffic_manager.set_synchronous_mode(True)
         traffic_manager.set_hybrid_physics_mode(True)

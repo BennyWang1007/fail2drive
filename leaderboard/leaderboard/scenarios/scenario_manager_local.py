@@ -11,6 +11,7 @@ It must not be modified and is for reference only!
 """
 
 from __future__ import print_function
+import os
 import signal
 import sys
 import time
@@ -61,6 +62,7 @@ class ScenarioManager(object):
         self._timestamp_last_run = 0.0
         self._timeout = float(timeout)
         self._max_frames = int(max_frames)
+        self._max_frames = int(os.environ.get("MAX_CARLA_FRAME", self._max_frames))
         if self._max_frames < 0:
             raise ValueError("max_frames must be >= 0")
         self._frames_run = 0
