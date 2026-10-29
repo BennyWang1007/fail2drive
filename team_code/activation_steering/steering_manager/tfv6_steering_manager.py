@@ -6,7 +6,7 @@ from typing import Optional, Union
 import torch
 
 
-from activation_steering.steering_manager.base_steering_manager import BaseSteeringManager
+from activation_steering.steering_manager.base_steering_manager import Alpha, AlphaVec, BaseSteeringManager
 
 
 class Tfv6SteeringManager(BaseSteeringManager):
@@ -19,7 +19,7 @@ class Tfv6SteeringManager(BaseSteeringManager):
         "right": "right_manual",
     }
 
-    INTERNAL_ALPHA_MULTIPLIERS: dict[str, list[float]] = {
+    INTERNAL_ALPHA_MULTIPLIERS: dict[str, AlphaVec] = {
         "decoder_layer4": [1.0, 1.1, 1.1],
         "decoder_layer5": [1.0, 1.5, 1.5],
         "decoder_layer6": [1.0, 0.9, 0.9],
@@ -98,7 +98,7 @@ class Tfv6SteeringManager(BaseSteeringManager):
     def get_steering_vector(
         self,
         model_idx: int,
-        alpha_input: float | list[float] | None,
+        alpha_input: Alpha,
     ) -> Optional[torch.Tensor]:
         """Calculates the weighted linear combination of steering vectors for the given model index."""
         if alpha_input is None:
@@ -135,20 +135,23 @@ class Tfv6SteeringManager(BaseSteeringManager):
 
         return total_steer
 
-    def get_steering_alphas(self, alpha: float | list[float]) -> list[float]:
+    def get_steering_alphas(self, alpha: Alpha) -> AlphaVec:
         """Returns the adjusted alphas based on the feature name and internal multipliers."""
-        if isinstance(alpha, (int, float)):
-            alphas = [float(alpha), float(alpha), float(alpha)]
-        else:
-            alphas = [float(a) for a in alpha]
+        # if isinstance(alpha, (int, float)):
+        #     alphas = [float(alpha), float(alpha), float(alpha)]
+        # else:
+        #     alphas = [float(a) for a in alpha]
 
-        # if self.feature_name in self.INTERNAL_ALPHA_MULTIPLIERS:
-        #     internal_multipliers = self.INTERNAL_ALPHA_MULTIPLIERS[self.feature_name]
-        #     alphas = [a * m for a, m in zip(alphas, internal_multipliers)]
+        # # if self.feature_name in self.INTERNAL_ALPHA_MULTIPLIERS:
+        # #     internal_multipliers = self.INTERNAL_ALPHA_MULTIPLIERS[self.feature_name]
+        # #     alphas = [a * m for a, m in zip(alphas, internal_multipliers)]
 
-        if hasattr(self, "internal_multipliers"):
-            alphas = [a * m for a, m in zip(alphas, self.internal_multipliers)]
-        else:
-            raise RuntimeError("internal_multipliers not set.")
+        # if hasattr(self, "internal_multipliers"):
+        #     alphas = [a * m for a, m in zip(alphas, self.internal_multipliers)]
+        # else:
+        #     raise RuntimeError("internal_multipliers not set.")
 
-        return alphas
+        alpha_vec = self._to_alpha_list(alpha)
+        alpha_vec = [a * m for a, m in zip(alpha_vec, self.internal_multipliers)]
+
+        return alpha_vec

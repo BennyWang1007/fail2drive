@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional, Sequence, Union
+from typing import List, Optional, Sequence, Union
 
 import torch
 
-from activation_steering.steering_manager.base_steering_manager import BaseSteeringManager
+from activation_steering.steering_manager.base_steering_manager import Alpha, AlphaVec, BaseSteeringManager
 
 
 class HiPADSteeringManager(BaseSteeringManager):
@@ -122,6 +122,42 @@ class HiPADSteeringManager(BaseSteeringManager):
                 f"Steering root does not exist: {self.steering_root}"
             )
 
+        # options: "auto", "manual", "legacy"
+        _vector_from: dict[str, str] = {
+            "break": "manual",
+            # "left": "manual",
+            # "right": "manual",
+            "left": "legacy",
+            "right": "legacy",
+        }
+
+        roots: dict[str, Path] = {}
+
+        for a, method in _vector_from.items():
+            env_map = self._env_fallback_paths()
+            # print(env_map)
+
+            if method == "manual":
+                cand_dir = self.steering_root / f"{a}_manual"
+            elif method == "auto":
+                cand_dir = self.steering_root / a
+            elif method == "legacy":
+                if a in env_map:
+                    cand_dir = env_map[a]
+                else:
+                    raise RuntimeError(
+                        f"Legacy steering vector for action '{a}' not found in ACTIVATION_VECTOR_PATHS."
+                    )
+            else:
+                raise ValueError(f"Unknown vector_from method: {method}")
+
+            print(f"[HiPADSteeringManager] Checking for steering vectors for action '{a}' in {cand_dir}")
+            if (cand_dir / self.feature_name).is_dir():
+                print(f"[HiPADSteeringManager] Found steering vectors for action '{a}' in {cand_dir}")
+                roots[a] = cand_dir
+
+        return roots
+
         # 1. Single-action root check: <root>/<feature_name>
         # if (self.steering_root / self.feature_name).is_dir():
         #     action = self.action or self._infer_action(self.steering_root.name)
@@ -138,6 +174,7 @@ class HiPADSteeringManager(BaseSteeringManager):
         roots: dict[str, Path] = {}
         for a in self.ACTIONS:
             # for candidate in (a, f"{a}_manual"):
+            # for candidate in (f"{a}_manual", a):
             for candidate in (f"{a}_manual",):
                 cand_dir = self.steering_root / candidate
                 print(f"[HiPADSteeringManager] Checking for steering vectors for action '{a}' in {cand_dir}")
@@ -194,31 +231,6 @@ class HiPADSteeringManager(BaseSteeringManager):
 
         return {action: Path(p) for action, p in zip(cls.ACTIONS, paths)}
 
-    # @staticmethod
-    # def _get_env_override_path(action: str) -> Path | None:
-    #     """Returns the override path for brake (index 0) or right (index 2).
-
-    #     Raises ValueError if ACTIVATION_VECTOR_PATHS is set but does not have
-    #     exactly 3 paths.
-    #     """
-    #     raw_env = os.environ.get("ACTIVATION_VECTOR_PATHS", "").strip()
-    #     if not raw_env:
-    #         return None
-
-    #     paths = [p.strip() for p in raw_env.split(",") if p.strip()]
-    #     if len(paths) != 3:
-    #         raise ValueError(
-    #             f"ACTIVATION_VECTOR_PATHS must contain exactly 3 paths (brake, left, right), "
-    #             f"got {len(paths)}: {raw_env}"
-    #         )
-
-    #     # Index mapping: 0 -> brake, 1 -> left, 2 -> right
-    #     overrides = {
-    #         "brake": Path(paths[0]),
-    #         "right": Path(paths[2]),
-    #     }
-    #     return overrides.get(action)
-
     def _load_all(self) -> None:
         # override_actions = {"brake", "right"}
         for action, path_or_root in self._action_roots().items():
@@ -251,30 +263,38 @@ class HiPADSteeringManager(BaseSteeringManager):
                 )
 
     # ------------------------------------------------------------------ query
-    def get_steering_alphas(self, alpha) -> list[float]:
+    def get_steering_alphas(self, alpha: Alpha) -> AlphaVec:
         """Return [brake, left, right] alphas after the internal per-action multipliers."""
-        values = torch.as_tensor(alpha).detach().cpu().flatten().float().tolist()
-        if len(values) == 1:
-            loaded = self.loaded_actions
-            target = loaded[0] if len(loaded) == 1 else "brake"
-            alphas = [0.0] * len(self.ACTIONS)
-            alphas[self.ACTIONS.index(target)] = values[0]
-        elif len(values) == len(self.ACTIONS):
-            alphas = list(values)
-        else:
-            raise ValueError("alpha must be a scalar or length 3 [brake, left, right].")
-        return [a * m for a, m in zip(alphas, self.internal_multipliers)]
+        # values = torch.as_tensor(alpha).detach().cpu().flatten().float().tolist()
+        # if len(values) == 1:
+        #     loaded = self.loaded_actions
+        #     target = loaded[0] if len(loaded) == 1 else "brake"
+        #     alphas = [0.0] * len(self.ACTIONS)
+        #     alphas[self.ACTIONS.index(target)] = values[0]
+        # elif len(values) == len(self.ACTIONS):
+        #     alphas = list(values)
+        # else:
+        #     raise ValueError("alpha must be a scalar or length 3 [brake, left, right].")
+
+        alpha_vec = self._to_alpha_list(alpha)
+
+        return [a * m for a, m in zip(alpha_vec, self.internal_multipliers)]
 
     def get_steering_vector(
         self,
         layer_idx: int,
-        alpha_input: float | list[float] | None,
+        alpha_input: Alpha,
     ) -> Optional[torch.Tensor]:
         """Weighted sum of the action vectors for one layer (None if nothing to add)."""
         if alpha_input is None:
             return None
+
+        alphas = self.get_steering_alphas(alpha_input)
+        if not any(a != 0.0 for a in alphas):
+            return None
+
         total: Optional[torch.Tensor] = None
-        for action, alpha in zip(self.ACTIONS, self.get_steering_alphas(alpha_input)):
+        for action, alpha in zip(self.ACTIONS, alphas):
             vector = self.vectors[action].get(layer_idx)
             if alpha != 0.0 and vector is not None:
                 total = alpha * vector if total is None else total + alpha * vector
@@ -282,12 +302,33 @@ class HiPADSteeringManager(BaseSteeringManager):
 
     def get_layer_vectors(
         self,
-        alpha_input: float | list[float] | None,
+        alpha_input: Alpha,
     ) -> dict[int, torch.Tensor]:
         """{layer_idx: vector} for every layer in ``steer_layers`` that has a non-zero vector."""
-        result: dict[int, torch.Tensor] = {}
+
+        if alpha_input is None:
+            return {}
+
+        alphas = self.get_steering_alphas(alpha_input)
+        if not any(alpha != 0.0 for alpha in alphas):
+            return {}
+
+        # result: dict[int, torch.Tensor] = {}
+        # for layer_idx in self.steer_layers:
+        #     vector = self.get_steering_vector(layer_idx, alpha_input)
+        #     if vector is not None:
+        #         result[layer_idx] = vector
+        # return result
+
+        result = {}
         for layer_idx in self.steer_layers:
-            vector = self.get_steering_vector(layer_idx, alpha_input)
-            if vector is not None:
-                result[layer_idx] = vector
+            total = None
+            for action, alpha in zip(self.ACTIONS, alphas):
+                vector = self.vectors[action].get(layer_idx)
+                if alpha != 0.0 and vector is not None:
+                    total = alpha * vector if total is None else total + alpha * vector
+
+            if total is not None:
+                result[layer_idx] = total
+
         return result
