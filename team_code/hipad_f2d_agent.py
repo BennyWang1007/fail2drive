@@ -101,6 +101,7 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
 
         self.feature_collector = None
         self.steering_manager = None
+        self.steering_manager_alpha = None
         self._steering_hooks = []
         self._steering_vectors = {}
 
@@ -199,14 +200,16 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
                 raise RuntimeError("HiP-AD plan refinement called without instance_feature.")
 
             # --- Steering Log ---
-            vec_norm = float(vec.norm().item())
-            frame = int(getattr(self, "step", -1)) + 1
-            print(
-                f"[Fail2DriveHiPADAgent] [STEERED] Frame {frame} | "
-                f"Layer {layer_idx} | "
-                f"Vector L2 Norm: {vec_norm:.4f} | "
-                f"Alpha: {self.hipad_activation_alpha}"
-            )
+            # vec_norm = float(vec.norm().item())
+            # frame = int(getattr(self, "step", -1)) + 1
+            # alpha = self.hipad_activation_alpha if self.legacy_hooks else \
+            #     self.steering_manager.get_steering_alphas(self.hipad_activation_alpha)
+            # print(
+            #     f"[Fail2DriveHiPADAgent] [STEERED] Frame {frame} | "
+            #     f"Layer {layer_idx} | "
+            #     f"Vector L2 Norm: {vec_norm:.4f} | "
+            #     f"Alpha: {alpha}"
+            # )
             # --------------------
 
             steered = self._shift_align_query(module, instance_feature, vec)
@@ -290,19 +293,20 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
         self.hipad_activation_alpha = self.activation_policy.alpha(frame)
         if self.legacy_hooks:
             os.environ["HIPAD_ACTIVATION_ALPHA"] = self._format_activation_alpha(self.hipad_activation_alpha)
+            print(f"[Fail2DriveHiPADAgent] Activation alpha (legacy) at frame {frame}: {self.hipad_activation_alpha}")
         else:
             # The agent-side hooks inject now; keep the in-model ActivationInjector off (alpha=0)
             # so the vectors are not added twice.
+            assert self.steering_manager is not None, "Steering manager must be initialized when legacy_hooks=False"
             os.environ["HIPAD_ACTIVATION_ALPHA"] = "0.0"
             print(f"[Fail2DriveHiPADAgent] Activation alpha at frame {frame}: {self.steering_manager.get_steering_alphas(self.hipad_activation_alpha)}")
-            self._steering_vectors = (
-                self.steering_manager.get_layer_vectors(self.hipad_activation_alpha)
-                if self.steering_manager is not None
-                else {}
-            )
+            self._steering_vectors = self.steering_manager.get_layer_vectors(self.hipad_activation_alpha)
+            self.steering_manager_alpha = self.steering_manager.get_steering_alphas(self.hipad_activation_alpha)
+            if not any(a > 0.0 for a in self.steering_manager_alpha):
+                self.steering_manager_alpha = None
+
         self.hipad_activation_plan_shift = self._activation_plan_shift(self.hipad_activation_alpha)
         os.environ["HIPAD_ACTIVATION_PLAN_SHIFT"] = str(float(self.hipad_activation_plan_shift))
-        print(f"[Fail2DriveHiPADAgent] Activation alpha at frame {frame}: {self.hipad_activation_alpha}")
         # print(f"[Fail2DriveHiPADAgent] HIPAD_ACTIVATION_ALPHA: {self._format_activation_alpha(self.hipad_activation_alpha)}")
         # print(f"[Fail2DriveHiPADAgent] Activation plan shift: {self.hipad_activation_plan_shift}")
 
@@ -314,12 +318,13 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
             return
         self.visual_save_path = Path(visual_root).resolve() / self.save_path.name
         self.visual_save_path.mkdir(parents=True, exist_ok=True)
-        (self.visual_save_path / "metas").mkdir(exist_ok=True)
+        # (self.visual_save_path / "metas").mkdir(exist_ok=True)
         (self.visual_save_path / "images").mkdir(exist_ok=True)
         self._remove_empty_log_visual_dirs()
 
     def _remove_empty_log_visual_dirs(self):
-        for folder in ("images", "metas"):
+        # for folder in ("images", "metas"):
+        for folder in ("images"):
             try:
                 (self.save_path / folder).rmdir()
             except OSError:
@@ -343,7 +348,7 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
 
         self.save_path.mkdir(parents=True, exist_ok=True)
         (self.save_path / "images").mkdir(parents=True, exist_ok=True)
-        (self.save_path / "metas").mkdir(parents=True, exist_ok=True)
+        # (self.save_path / "metas").mkdir(parents=True, exist_ok=True)
 
         try:
             return super().visualize(*args, **kwargs)
@@ -398,8 +403,8 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
         output_path = self.visual_save_path or self.save_path
         frame = self.step
         Image.fromarray(image).save(output_path / "images" / ("%04d.png" % frame))
-        with open(output_path / "metas" / ("%04d.json" % frame), "w", encoding="utf-8") as outfile:
-            json.dump(self.pid_metadata, outfile, indent=4)
+        # with open(output_path / "metas" / ("%04d.json" % frame), "w", encoding="utf-8") as outfile:
+        #     json.dump(self.pid_metadata, outfile, indent=4)
 
     def _visualize_video(self):
         """Stitch saved frames into a browser/VSCode-compatible H.264 MP4."""
@@ -430,8 +435,10 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
 
         height, width = first_frame.shape[:2]
 
-        video_path = self.visual_save_path / "driving_visualization.mp4"
-        tmp_video_path = self.visual_save_path / "_driving_visualization_tmp.mp4"
+        vid_name = f"viz_{self.save_path.name}.mp4"
+
+        video_path = self.visual_save_path / vid_name
+        tmp_video_path = self.visual_save_path / f"_{vid_name}"
 
         # OpenCV first writes a temporary video.
         # It is converted to H.264 below using ffmpeg.
@@ -586,6 +593,7 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
             return
         metadata = getattr(self, "pid_metadata", {})
         frame = int(getattr(self, "step", -1))
+        alpha = self.hipad_activation_alpha if self.legacy_hooks else self.steering_manager_alpha
         record = {
             "frame": frame,
             "speed": float(metadata.get("speed", 0.0)),
@@ -594,7 +602,7 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
             "throttle": float(control.throttle),
             "brake": float(control.brake),
             "stop_for_stop_sign": False,
-            "activation_alpha": self._json_activation_alpha(self.hipad_activation_alpha),
+            "activation_alpha": self._json_activation_alpha(alpha),
             "activation_plan_shift": float(self.hipad_activation_plan_shift),
             "feature_path": self._plan_feature_path(frame),
         }
