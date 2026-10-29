@@ -20,9 +20,7 @@ if [[ "${FORCE:-0}" == "1" ]]; then
 fi
 
 for FEATURE_NAME in align_query; do
-    # for LAYER in layer_05; do
     for LAYER in layer_00 layer_01 layer_02 layer_03 layer_04 layer_05; do
-        # FULL_FEATURE_NAME="${FEATURE_NAME}/${LAYER}"
         for CONFIG in \
             "brake Brake brake_manual" \
             "left_change_lane LaneChangeLeft left_manual" \
@@ -49,9 +47,7 @@ done
 
 
 for FEATURE_NAME in align_query; do
-    # for LAYER in layer_05; do
     for LAYER in layer_00 layer_01 layer_02 layer_03 layer_04 layer_05; do
-        # FULL_FEATURE_NAME="${FEATURE_NAME}/${LAYER}"
         for CONFIG in \
             "brake Brake brake" \
             "left_change_lane LaneChangeLeft left" \

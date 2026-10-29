@@ -64,6 +64,12 @@ def parse_args() -> argparse.Namespace:
         help='Optional model name to use for feature collection. If not provided, the default collector is used.',
     )
     parser.add_argument(
+        '--model-count',
+        type=int,
+        default=1,
+        help='Number of ensemble models to process. Default is 1.',
+    )
+    parser.add_argument(
         '--layer-name',
         '--layer_name',
         default=None,
@@ -87,7 +93,7 @@ def parse_args() -> argparse.Namespace:
         default='brake',
         help='Target action to use as the negative class: brake, left_change_lane, or right_change_lane.',
     )
-    parser.add_argument('--model-index', type=int, default=0,
+    parser.add_argument('--model-index', type=int, default=-1,
                         help='Feature subdir to use for ensembles.')
     parser.add_argument('--max-frames-per-class', type=int, default=0)
     parser.add_argument('--flatten', action='store_true',
@@ -476,33 +482,55 @@ def feature_path_for(
     action: str = args.action
 
     # 1. Direct path from log record if explicitly given and no feature_name override is requested
-    if row.get('feature_path'):
+    if not args.feature_name and row.get('feature_path'):
         p = Path(row['feature_path'])
         if p.exists():
             return p
 
     # 2. Resolve via FeatureCollector path standard: <features_root>/<run_name>/<feature_name>/...
-    features_root = features_root / action_dir_name(action) / 'features'
-    run_feature_dir = features_root / run_name
+    if run_name.startswith('Normal_'):
+        base_features_root = features_root / 'Normal' / 'features'
+    else:
+        base_features_root = features_root / action_dir_name(action) / 'features'
+
+    run_feature_dir = base_features_root / run_name
 
     feature_collector: FeatureCollector
-    if args.model_name == 'tfv6':
-        feature_collector = TFv6FeatureCollector(output_root=run_feature_dir,)
+    feature_name = args.feature_name
+    if args.model_name == 'hipad':
+        from activation_steering.feature_collectors.hipad_feature_collector import HiPADFeatureCollector
+        layer_index = int(args.layer_name.split('_')[-1]) if args.layer_name else 0
+        feature_collector = HiPADFeatureCollector(output_root=run_feature_dir, feature_name=feature_name)
+        candidate = feature_collector.resolve_feature_path(
+            feature_dir=run_feature_dir,
+            frame_idx=frame,
+            feature_name=feature_name,
+            layer_index=layer_index,
+            model_idx=args.model_index,
+        )
+        # print(f"Resolved HiPAD feature path for run '{run_name}', feature '{feature_name}', layer '{args.layer_name}', frame {frame:06d}: {candidate}, run_feature_dir: {run_feature_dir}")
     else:
-        feature_collector = DefaultFeatureCollector(output_root=run_feature_dir)
+        if args.model_name == 'tfv6':
+            feature_collector = TFv6FeatureCollector(output_root=run_feature_dir)
+        else:
+            feature_collector = DefaultFeatureCollector(output_root=run_feature_dir)
+        candidate = feature_collector.resolve_feature_path(
+            feature_dir=run_feature_dir,
+            frame_idx=frame,
+            feature_name=feature_name,
+            model_idx=args.model_index,
+        )
 
-    candidate = feature_collector.resolve_feature_path(
-        feature_dir=run_feature_dir,
-        frame_idx=frame,
-        feature_name=args.feature_name,
-        model_idx=args.model_index,
-    )
+    # print(f"Resolved feature path for run '{run_name}', frame {frame:06d}: {candidate}")
 
     if candidate.exists():
         return candidate
 
     # 3. Fallback to adapter
     print("Falling back to adapter for feature path resolution.")
+    if args.model_index == -1:
+        return adapter.feature_path_for(row, log_source, features_root, 0)
+
     return adapter.feature_path_for(row, log_source, features_root, args.model_index)
 
 
@@ -561,12 +589,20 @@ def frames_signature(frames: dict[str, set[int]]) -> str:
     return h.hexdigest()
 
 
-def output_dirs_for(output_dir: Path, model_count: int, feature_name: str | None) -> list[Path]:
+def output_dirs_for(
+    output_dir: Path,
+    model_count: int,
+    feature_name: str | None,
+    layer_name: str | None,
+) -> list[Path]:
     dirs = []
     for model_idx in range(model_count):
         current = output_dir / f'model_{model_idx:02d}' if model_count > 1 else output_dir
         if feature_name:
             current = current / feature_name
+        if layer_name:
+            layer_index = int(layer_name.split('_')[-1])
+            current = current / f'layer_{layer_index:02d}'
         dirs.append(current)
     return dirs
 
@@ -760,7 +796,7 @@ def main() -> int:
         'post_process' / (args.folder_name or args.action)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    model_count: int = 3
+    model_count: int = args.model_count
 
     manual_path = None
     manual_frames: dict[str, set[int]] = {}
@@ -782,7 +818,8 @@ def main() -> int:
 
     signature = build_run_signature(
         args, manual_path, manual_frames, manual_negative_path, manual_negative_frames)
-    expected_output_dirs = output_dirs_for(output_dir, model_count, args.feature_name)
+    expected_output_dirs = output_dirs_for(
+        output_dir, model_count, args.feature_name, args.layer_name)
 
     if not args.force and expected_output_dirs and all(
         cache_is_fresh(d, signature) for d in expected_output_dirs
@@ -803,7 +840,11 @@ def main() -> int:
         'negative_count': 0,
         'flatten': args.flatten,
     } for _ in range(model_count)]
-    manifest_path = output_dir / 'selected_frames.jsonl'
+    manifest_dir = output_dir / args.feature_name if args.feature_name else output_dir
+    layer_index = int(args.layer_name.split('_')[-1]) if args.layer_name else 0
+    manifest_dir = manifest_dir / f'layer_{layer_index:02d}' if args.layer_name else manifest_dir
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = manifest_dir / 'selected_frames.jsonl'
     missing_features = 0
     total_rows = 0
 
@@ -866,6 +907,9 @@ def main() -> int:
 
         if args.feature_name:
             current_output_dir = current_output_dir / args.feature_name
+
+        if args.layer_name:
+            current_output_dir = current_output_dir / f'layer_{layer_index:02d}'
 
         current_output_dir.mkdir(parents=True, exist_ok=True)
 
