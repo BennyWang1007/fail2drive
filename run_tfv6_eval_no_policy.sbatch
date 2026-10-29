@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=tfv6_steering_eval
+#SBATCH --job-name=tfv6_no_policy_eval
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 #SBATCH --ntasks=1
@@ -16,25 +16,29 @@ mkdir -p logs
 cd "$SLURM_SUBMIT_DIR"
 
 source ~/miniconda3/etc/profile.d/conda.sh
+set +u
 conda activate fail2drive
+set -u
 
-export STEERING_POLICY="none"
+# Load common + tfv6 + no_policy settings, and override DEBUG_CHALLENGE
+env_var_cmd="source $PWD/f2d_env_config.sh && load_f2d_env common tfv6 no_policy && export DEBUG_CHALLENGE=0"
 
-export CARLA_ROOT="$PWD/f2d_carla"
-export LIVE_VISU=0
-export DEBUG_CHALLENGE=0
-export DEBUG_LOG_EGO_STAT=true
-export ORACLE_VERBOSE=true
+dry_run=""
+# dry_run=" --dry-run"
 
-export STEERING_FEATURE_NAME="fused_features"
-env_cmd="export DEBUG_LOG_EGO_STAT=$DEBUG_LOG_EGO_STAT; export ORACLE_VERBOSE=$ORACLE_VERBOSE"
+# In the current Controller Shell, execute the command to load all environment variables for this script
+eval "$env_var_cmd"
 
+# Start the evaluation and pass the same load command to the child task
 python -u slurm_evaluate.py \
   --routes fail2drive_split \
   --seeds 3 \
   --retries 1 \
-  --out_root results/tfv6_fused_no_policy \
+  --out_root "results_shome/tfv6_${STEERING_FEATURE_NAME_SHORT}_no_policy" \
   --agent_file "$LEAD_ROOT/lead/inference/sensor_agent.py" \
   --agent_config "$LEAD_ROOT/outputs/checkpoints/tfv6_resnet34" \
-  --lb_script leaderboard/leaderboard/leaderboard_evaluator_local.py
-  --env_var_cmd "$env_cmd"
+  --lb_script leaderboard/leaderboard/leaderboard_evaluator_local.py \
+  --env_var_cmd "$env_var_cmd" \
+  --verbose \
+  --job_prefix "F2D_TFV6_No_Policy_" \
+  $dry_run
