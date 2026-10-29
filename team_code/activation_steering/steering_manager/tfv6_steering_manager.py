@@ -20,8 +20,9 @@ class Tfv6SteeringManager(BaseSteeringManager):
     }
 
     INTERNAL_ALPHA_MULTIPLIERS: dict[str, list[float]] = {
-        "decoder_layer5": [1.0, 3.0, 2.5],
-        "decoder_layer6": [1.0, 2.5, 2.5],
+        "decoder_layer4": [1.0, 1.1, 1.1],
+        "decoder_layer5": [1.0, 1.5, 1.5],
+        "decoder_layer6": [1.0, 0.9, 0.9],
         "fused_features": [1.0, 1.1, 1.1],
         # "fused_features": [1.0, 1.5, 1.5],
     }

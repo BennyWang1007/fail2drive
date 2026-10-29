@@ -9,7 +9,7 @@ class BaseSteeringManager:
 
     def get_steering_vector(
         self,
-        model_idx: int,
-        alpha_input: Optional[Union[float, list[float]]],
+        *args,
+        **kwargs
     ) -> Optional[torch.Tensor]:
         raise NotImplementedError

@@ -12,6 +12,7 @@ from depth_ttc_gate import DepthTTCClient, DepthTTCDecision
 Trigger = Tuple[str, str, Optional[int], float]
 Latch = Tuple[str, int]
 Alpha = Optional[Union[float, List[float]]]
+AlphaVec = List[float]  # [brake, left, right]
 # predict(alpha) -> open-loop prediction (no PID / controller side effects)
 PredictFn = Callable[[Alpha], Any]
 ImageFn = Callable[[], np.ndarray]
@@ -105,7 +106,7 @@ class FixedAfterFramePolicy(ActivationPolicy):
             raise ValueError(
                 f"STEERING_COMMAND must be one of 'brake', 'left', or 'right', got '{steering_command}'")
 
-        self.steering_vec: list[float]
+        self.steering_vec: AlphaVec
         if steering_command == "brake":
             self.steering_vec = [self.fixed_alpha, 0.0, 0.0]
         elif steering_command == "left":
@@ -115,7 +116,7 @@ class FixedAfterFramePolicy(ActivationPolicy):
         else:
             self.steering_vec = [self.fixed_alpha, self.fixed_alpha, self.fixed_alpha]
 
-    def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> list[float]:
+    def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> AlphaVec:
         if frame < self.start_frame:
             return [0.0, 0.0, 0.0]
         if self.end_frame is not None and frame > self.end_frame:
@@ -332,7 +333,7 @@ class VLMPolicy(ActivationPolicy):
             os.environ.get("VLM_WEAK_BRAKE_ALPHA", 0.5))
         self.lateral_alpha = float(os.environ.get("VLM_LATERAL_ALPHA", 1.0))
 
-    def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> list[float]:
+    def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> AlphaVec:
         print("Running VLMPolicy.alpha with vlm_decision:", vlm_decision, "decision_age_frames:", decision_age_frames)
         alpha_vector = [0.0 for _ in self.ACTIONS]
         if vlm_decision is None:
@@ -428,7 +429,7 @@ class _BaseOraclePolicy(ActivationPolicy):
         self._cooldown_until = [-1 for _ in self.ACTIONS]
         self._last_trigger_key = None
 
-    def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> list[float]:
+    def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> AlphaVec:
         print("Running _BaseOraclePolicy.alpha with frame:", frame)
         alpha_vector = [0.0 for _ in self.ACTIONS]
         if self.fixed_alpha <= 0.0:
@@ -440,7 +441,7 @@ class _BaseOraclePolicy(ActivationPolicy):
             print(f"[{self.__class__.__name__}] frame={frame} Ego actor is None or not alive, returning alpha_vector={alpha_vector}")
             return alpha_vector
 
-        self._debug_both_lane_clear(ego, data_provider)  # For debugging, check both lane clearance and print debug info
+        # self._debug_both_lane_clear(ego, data_provider)  # For debugging, check both lane clearance and print debug info
         # self._debug_current_lane_clear_distance(ego, data_provider)  # For debugging, check current lane clearance distance and print debug info
 
         triggers = self._oracle_triggers()
@@ -516,7 +517,8 @@ class _BaseOraclePolicy(ActivationPolicy):
             self._cooldown_until[action_index] = self._active_until[action_index] + \
                 self.cooldown_frames
             alpha_vector[action_index] = self.fixed_alpha
-            print(f"[{self.__class__.__name__}] setting _active_until[{action}]={self._active_until[action_index]}, _cooldown_until[{action}]={self._cooldown_until[action_index]}, alpha_vector={alpha_vector}")
+            print(f"[{self.__class__.__name__}] setting _active_until[{action}]={self._active_until[action_index]}, "
+                  f"_cooldown_until[{action}]={self._cooldown_until[action_index]}, alpha_vector={alpha_vector}")
             self._log_trigger(frame, action, scenario_type, actor_id, distance)
 
             if not self.allow_multi_action:
@@ -668,7 +670,12 @@ class _BaseOraclePolicy(ActivationPolicy):
             max(ego_forward_speed, 0.0) * self.brake_reaction_time +
             max(ego_forward_speed, 0.0)**2 / (2.0 * self.brake_deceleration) +
             self.brake_distance_margin)
-        print(f"[{self.__class__.__name__}._scenario_actor_brake_hazard] longitudinal={longitudinal:.2f}, lateral={lateral:.2f}, closing_speed={closing_speed:.2f}, ttc={ttc:.2f}, stopping_distance={stopping_distance:.2f}")
+
+        if self.verbose:
+            print(f"[{self.__class__.__name__}._scenario_actor_brake_hazard] longitudinal={longitudinal:.2f}, "
+                  f"lateral={lateral:.2f}, closing_speed={closing_speed:.2f}, "
+                  f"ttc={ttc:.2f}, stopping_distance={stopping_distance:.2f}")
+
         return ttc <= self.brake_ttc_threshold or longitudinal <= stopping_distance
 
     @staticmethod
@@ -788,6 +795,18 @@ class PDMOraclePolicy(_BaseOraclePolicy):
         parking_exit_side_margin: float = 1.0,
         parking_exit_rear_time_gap: float = 3.0,
         general_brake: bool = False,
+        # [NEW] Same-lane check for lateral (left/right) triggers.
+        #   "lateral": skip steering if |lateral offset| > same_lane_lateral_margin
+        #   "lane":    skip steering if ego and obstacle are on different (road_id, lane_id)
+        #   "both":    skip if either of the above says "different lane"
+        #   "off":     disable (old behaviour)
+        same_lane_mode: str = "lateral",
+        same_lane_lateral_margin: float = 3.0,
+        # [NEW] Speed-scaled trigger distance for RoadBlocked / YieldToEmergencyVehicle.
+        # The trigger radius becomes min(static_distance, stopping_distance(v) + margin)
+        # instead of a fixed radius, so a slow ego no longer brakes/steers 40-50 m out.
+        speed_scaled_limits: bool = True,
+        speed_scaled_margin: float = 6.0,
     ):
         super().__init__(
             alpha=alpha,
@@ -809,6 +828,10 @@ class PDMOraclePolicy(_BaseOraclePolicy):
             allow_multi_action=allow_multi_action,
             verbose=verbose,
         )
+        self.speed_scaled_limits = bool(speed_scaled_limits)
+        self.speed_scaled_margin = float(speed_scaled_margin)
+        self.same_lane_mode = str(same_lane_mode).lower().strip()
+        self.same_lane_lateral_margin = float(same_lane_lateral_margin)
         self.two_way_clear_distance = float(two_way_clear_distance)
         self.lane_key_search_distance = float(lane_key_search_distance)
         self.side_hazard_distance = float(side_hazard_distance)
@@ -908,9 +931,16 @@ class PDMOraclePolicy(_BaseOraclePolicy):
                 "PDM_ORACLE_PARKING_EXIT_REAR_TIME_GAP", 3.0)),
             general_brake=_strtobool(
                 os.environ.get("PDM_ORACLE_GENERAL_BRAKE")),
+            same_lane_mode=os.environ.get("PDM_ORACLE_SAME_LANE_MODE", "lateral"),
+            same_lane_lateral_margin=float(os.environ.get(
+                "PDM_ORACLE_SAME_LANE_LATERAL_MARGIN", 2.0)),
+            speed_scaled_limits=_strtobool(os.environ.get(
+                "PDM_ORACLE_SPEED_SCALED_LIMITS", "1")),
+            speed_scaled_margin=float(os.environ.get(
+                "PDM_ORACLE_SPEED_SCALED_MARGIN", 6.0)),
         )
 
-    def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> list[float]:
+    def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> AlphaVec:
         # print(f"[{self.__class__.__name__}.alpha] frame={frame}, vlm_decision={vlm_decision}, decision_age_frames={decision_age_frames}")
         return super().alpha(frame, vlm_decision, decision_age_frames)
 
@@ -942,10 +972,11 @@ class PDMOraclePolicy(_BaseOraclePolicy):
                 if scenario_type in self.ACTIVE_BRAKE_SCENARIOS and self._action_allowed("brake"):
                     triggers.append(("brake", scenario_type, None, 0.0))
                 continue
-            distance = self._horizontal_distance(
-                ego_location, actor.get_location())
-            print(f"[{self.__class__.__name__}._oracle_triggers] distance to actor={distance}")
+            distance = self._horizontal_distance(ego_location, actor.get_location())
+            if self.verbose:
+                print(f"[{self.__class__.__name__}._oracle_triggers] distance to actor={distance}")
             scenarios.append((distance, scenario_type, scenario_data, actor))
+
         scenarios.sort(key=lambda item: item[0])
 
         for distance, scenario_type, scenario_data, actor in scenarios:
@@ -959,7 +990,20 @@ class PDMOraclePolicy(_BaseOraclePolicy):
             # still allowed when an initially unsafe adjacent lane becomes clear.
             if action in ("left", "right") and self._ego_has_passed_actor(ego, actor):
                 continue
-            if self.min_distance <= distance <= self._distance_limit_for_scenario(scenario_type):
+            # [NEW] After a lane change the ego is in a different lane from the
+            # obstacle but still behind it, so the distance check below would
+            # re-trigger another steer. Skip lateral actions when the obstacle is
+            # no longer in the ego's lane.
+            if (
+                action in ("left", "right") and
+                scenario_type in self.LANE_CHECK_SCENARIOS and
+                not self._actor_in_ego_lane(ego, actor)
+            ):
+                if self.verbose:
+                    print(f"[{self.__class__.__name__}._oracle_triggers] scenario_type={scenario_type} "
+                          f"actor not in ego lane, skipping lateral action={action}")
+                continue
+            if self.min_distance <= distance <= self._distance_limit_for_scenario(scenario_type, ego):
                 actor_id = getattr(actor, "id", None)
                 triggers.append((action, scenario_type, actor_id, distance))
 
@@ -988,7 +1032,80 @@ class PDMOraclePolicy(_BaseOraclePolicy):
     # def _lateral_hold_invalidated(self) -> bool:
     #     return self._parking_exit_blocked
 
-    def _distance_limit_for_scenario(self, scenario_type: str) -> float:
+    # [NEW] Scenarios whose lateral trigger is gated by the same-lane check.
+    # Edit this set if some scenario's obstacle legitimately sits off the ego lane.
+    LANE_CHECK_SCENARIOS = ONE_WAY_LATERAL_SCENARIOS | TWO_WAY_LATERAL_SCENARIOS
+
+    def _actor_in_ego_lane(self, ego, actor) -> bool:
+        """[NEW] Whether the obstacle is still in the ego's lane (True = may steer).
+
+        Lateral offset is measured along the right vector of the ego's lane
+        waypoint (not the ego heading), so it is not distorted by the ego's yaw
+        while it is mid lane-change. If map data is unavailable the check passes.
+        """
+        mode = self.same_lane_mode
+        if mode in ("off", "none", "false", "0", ""):
+            return True
+
+        ego_location = ego.get_location()
+        actor_location = actor.get_location()
+        world_map = self._get_map(CarlaDataProvider)
+        ego_wp = self._get_waypoint_driving(world_map, ego_location) if world_map is not None else None
+        actor_wp = self._get_waypoint_driving(world_map, actor_location) if world_map is not None else None
+
+        if mode in ("lateral", "both"):
+            try:
+                if ego_wp is not None:
+                    right = ego_wp.transform.get_right_vector()
+                else:
+                    right = ego.get_transform().get_right_vector()
+                lateral = abs((actor_location.x - ego_location.x) * right.x +
+                              (actor_location.y - ego_location.y) * right.y)
+            except Exception:
+                lateral = 0.0
+
+            if self.verbose:
+                print(f"[{self.__class__.__name__}._actor_in_ego_lane] lateral={lateral:.2f} "
+                      f"margin={self.same_lane_lateral_margin:.2f}")
+            if lateral > self.same_lane_lateral_margin:
+                return False
+
+        if mode in ("lane", "both"):
+            if ego_wp is not None and actor_wp is not None:
+                # Lane ids are not comparable inside junctions; do not block there.
+                if not (getattr(ego_wp, "is_junction", False) or getattr(actor_wp, "is_junction", False)):
+                    same_lane = (ego_wp.road_id == actor_wp.road_id and
+                                 ego_wp.lane_id == actor_wp.lane_id)
+                    if self.verbose:
+                        print(f"[{self.__class__.__name__}._actor_in_ego_lane] "
+                              f"ego=(road {ego_wp.road_id}, lane {ego_wp.lane_id}) "
+                              f"actor=(road {actor_wp.road_id}, lane {actor_wp.lane_id})")
+                    if not same_lane:
+                        return False
+
+        return True
+
+    def _speed_scaled_limit(self, static_limit: float, ego) -> float:
+        """[NEW] min(static_limit, v*t_react + v^2/(2a) + margin).
+
+        Uses the ego's current speed and the existing brake_reaction_time /
+        brake_deceleration. ``speed_scaled_margin`` should cover the two vehicle
+        half-lengths (the distance used here is center-to-center) plus a gap.
+        Never larger than the original fixed limit.
+        """
+        if not self.speed_scaled_limits or ego is None:
+            return static_limit
+        try:
+            velocity = ego.get_velocity()
+            speed = math.hypot(float(velocity.x), float(velocity.y))
+        except Exception:
+            return static_limit
+        stopping = (speed * self.brake_reaction_time +
+                    speed ** 2 / (2.0 * self.brake_deceleration) +
+                    self.speed_scaled_margin)
+        return min(static_limit, stopping)
+
+    def _distance_limit_for_scenario(self, scenario_type: str, ego=None) -> float:
         if scenario_type in self.ACTIVE_BRAKE_SCENARIOS:
             # Activation itself is the trigger for this rule, so do not discard it
             # merely because the crossing actor is still off the driving lane.
@@ -998,11 +1115,14 @@ class PDMOraclePolicy(_BaseOraclePolicy):
         if scenario_type in ("HazardAtSideLaneTwoWays",):
             return self.side_hazard_two_way_distance
         if scenario_type == "RoadBlocked":
-            return self.roadblocked_distance
+            # return self.roadblocked_distance
+            # return self._speed_scaled_limit(self.yield_emergency_distance, ego)
+            return max(self._speed_scaled_limit(self.roadblocked_distance, ego), 8.0)
         if scenario_type in self.PRIORITY_BRAKE_SCENARIOS:
             return self.priority_distance
         if scenario_type == "YieldToEmergencyVehicle":
-            return self.yield_emergency_distance
+            # return self.yield_emergency_distance
+            return self._speed_scaled_limit(self.yield_emergency_distance, ego)
         return self.trigger_distance
 
     def _action_from_pdm_state(self, scenario_type, scenario_data, ego, actor, distance, data_provider) -> str | None:
@@ -1020,25 +1140,36 @@ class PDMOraclePolicy(_BaseOraclePolicy):
 
         if scenario_type in self.TWO_WAY_LATERAL_SCENARIOS:
             direction = self._scenario_direction(scenario_data)
-            latch_key = self._two_way_latch_key(
-                scenario_type, scenario_data, actor)
-            # print(f"[{self.__class__.__name__}._action_from_pdm_state] scenario_type: {scenario_type} is in TWO_WAY_LATERAL_SCENARIOS, direction: {direction}, latch_key: {latch_key}")
-            print(f"[{self.__class__.__name__}._action_from_pdm_state] _two_way_path_clear: {self._two_way_path_clear(ego, scenario_data, direction, data_provider)}")
+            latch_key = self._two_way_latch_key(scenario_type, scenario_data, actor)
+            if self.verbose:
+                print(f"[{self.__class__.__name__}._action_from_pdm_state] _two_way_path_clear: "
+                      f"{self._two_way_path_clear(ego, scenario_data, direction, data_provider)}")
+
             if self._two_way_path_clear(ego, scenario_data, direction, data_provider):
                 self._two_way_brake_latches.discard(latch_key)
-                print(f"[{self.__class__.__name__}._action_from_pdm_state] Path is clear, returning lateral action for direction: {direction} -> {self._lateral_action_from_direction(direction)}")
+                if self.verbose:
+                    print(f"[{self.__class__.__name__}._action_from_pdm_state] Path is clear, returning lateral action for direction: "
+                          f"{direction} -> {self._lateral_action_from_direction(direction)}")
                 return self._lateral_action_from_direction(direction)
+
             if latch_key in self._two_way_brake_latches:
-                print(f"[{self.__class__.__name__}._action_from_pdm_state] Latch key {latch_key} is in _two_way_brake_latches, returning 'brake'")
+                if self.verbose:
+                    print(f"[{self.__class__.__name__}._action_from_pdm_state] Latch key {latch_key} is in _two_way_brake_latches, returning 'brake'")
                 return "brake"
-            print(f"[{self.__class__.__name__}._action_from_pdm_state] _scenario_actor_brake_hazard: {self._scenario_actor_brake_hazard(ego, actor)}")
-            if self._scenario_actor_brake_hazard(ego, actor):
+
+            active_brake_hazard = self._scenario_actor_brake_hazard(ego, actor)
+            if self.verbose:
+                print(f"[{self.__class__.__name__}._action_from_pdm_state] _scenario_actor_brake_hazard: "
+                      f"{active_brake_hazard}")
+
+            if active_brake_hazard:
                 # Once braking starts for a blocked two-way detour, keep braking until
                 # the target lane is clear.  Slowing down otherwise makes the closing
                 # speed fall below the instantaneous hazard threshold and prematurely
                 # releases the brake.
                 self._two_way_brake_latches.add(latch_key)
-                print(f"[{self.__class__.__name__}._action_from_pdm_state] Adding latch key {latch_key} to _two_way_brake_latches")
+                if self.verbose:
+                    print(f"[{self.__class__.__name__}._action_from_pdm_state] Adding latch key {latch_key} to _two_way_brake_latches")
                 return "brake"
             return None
 
@@ -1057,7 +1188,8 @@ class PDMOraclePolicy(_BaseOraclePolicy):
             return self._yield_emergency_action(ego, data_provider)
 
         if scenario_type == "RoadBlocked":
-            if distance <= self.roadblocked_distance:
+            # if distance <= self.roadblocked_distance:
+            if distance <= self._distance_limit_for_scenario("RoadBlocked", ego):
                 return "brake"
             return None
 
@@ -1136,7 +1268,11 @@ class PDMOraclePolicy(_BaseOraclePolicy):
 
         vehicles = self._vehicle_actors(data_provider)
         vehicles = [v for v in vehicles if getattr(v, "id", None) not in ignored_ids and getattr(v, "is_alive", True)]
-        return self._lane_clear(ego, target_lane, data_provider, vehicles=vehicles)
+        lane_clear = self._lane_clear(ego, target_lane, data_provider, vehicles=vehicles)
+        if self.verbose:
+            print(f"[{self.__class__.__name__}._two_way_path_clear] "
+                  f"Checking lane clearance for direction={direction} -> {lane_clear}")
+        return lane_clear
 
     @staticmethod
     def _two_way_latch_key(scenario_type: str, scenario_data, actor) -> Latch:
@@ -1425,7 +1561,7 @@ class PDMOraclePolicy(_BaseOraclePolicy):
 
     def _lane_clear(self, ego, target_lane, data_provider: CarlaDataProvider, vehicles: list | None = None) -> bool:
         # print(f"[{self.__class__.__name__}._lane_clear] Checking lane: {target_lane}'s clearance")
-        print(f"[{self.__class__.__name__}._lane_clear] Checking lane's clearance")
+        # print(f"[{self.__class__.__name__}._lane_clear] Checking lane's clearance")
         world_map = self._get_map(data_provider)
         if world_map is None:
             return False
@@ -1485,7 +1621,10 @@ class PDMOraclePolicy(_BaseOraclePolicy):
             # gap = abs(center_offset_lane) - half_sum
             gap = abs(center_offset_lane)
             vehicle_half = self._projected_half_length(vehicle, lane_forward)
-            # print(f"[{self.__class__.__name__}._lane_clear] Vehicle {getattr(vehicle, 'id', None)}: center_offset_lane: {center_offset_lane:.2f}, longitudinal_ego: {longitudinal_ego:.2f}, gap: {gap:.2f}, vehicle_half: {vehicle_half:.2f}")
+            # if self.verbose:
+            #     print(f"[{self.__class__.__name__}._lane_clear] Vehicle {getattr(vehicle, 'id', None)}: "
+            #         f"center_offset_lane: {center_offset_lane:.2f}, longitudinal_ego: {longitudinal_ego:.2f}, "
+            #         f"gap: {gap:.2f}, vehicle_half: {vehicle_half:.2f}")
 
             if lane_same_direction:
                 front_distance = ego_half + vehicle_half - 0.2
@@ -1510,8 +1649,10 @@ class PDMOraclePolicy(_BaseOraclePolicy):
                     (not lane_same_direction and longitudinal_ego > 0.0)
                 )
 
-                if not is_closing:
-                    print(f"[{self.__class__.__name__}._lane_clear] Vehicle {getattr(vehicle, 'id', None)} is not closing on ego (vehicle_speed: {vehicle_speed:.2f}, lane_same_direction: {lane_same_direction}, longitudinal_ego: {longitudinal_ego:.2f})")
+                if self.verbose and not is_closing:
+                    print(f"[{self.__class__.__name__}._lane_clear] Vehicle {getattr(vehicle, 'id', None)} "
+                          f"is not closing on ego (vehicle_speed: {vehicle_speed:.2f}, lane_same_direction: "
+                          f"{lane_same_direction}, longitudinal_ego: {longitudinal_ego:.2f})")
                     continue
 
                 current_lane = world_map.get_waypoint(ego.get_location())
@@ -1536,12 +1677,18 @@ class PDMOraclePolicy(_BaseOraclePolicy):
                 if lane_same_direction:
                     max_time_gap *= 0.6  # Allow more time gap for same-direction traffic
 
-                print(f"[{self.__class__.__name__}._lane_clear] Vehicle {getattr(vehicle, 'id', None)} is closing on ego")
+                if self.verbose:
+                    print(f"[{self.__class__.__name__}._lane_clear] Vehicle {getattr(vehicle, 'id', None)} is closing on ego")
+
                 if closing_speed > 0.1 and gap / closing_speed <= self.parking_exit_rear_time_gap:
-                    print(f"Parking exit blocked (rear closing) at gap {gap:.2f} m with closing speed {closing_speed:.2f} m/s")
+                    if self.verbose:
+                        print(f"Parking exit blocked (rear closing) at gap {gap:.2f} m "
+                              f"with closing speed {closing_speed:.2f} m/s")
                     return False
 
-        print(f"[{self.__class__.__name__}._lane_clear] Lane is clear for parking exit")
+        if self.verbose:
+            print(f"[{self.__class__.__name__}._lane_clear] Lane is clear for parking exit")
+
         return True
 
         #     longitudinal = diff.x * ego_forward.x + diff.y * ego_forward.y
@@ -1698,6 +1845,15 @@ class PDMOraclePolicy(_BaseOraclePolicy):
         return [item for item in scenario_data if hasattr(item, "get_location") and getattr(item, "is_alive", True)]
 
 
+class PDMOracleBreakOnlyPolicy(PDMOraclePolicy):
+    """A PDMOraclePolicy that always brakes when a hazard is detected."""
+
+    def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> AlphaVec:
+        alpha = super().alpha(frame, vlm_decision, decision_age_frames)
+        alpha = [alpha[0], 0.0, 0.0]  # Always brake, never steer
+        return alpha
+
+
 class NoPolicy(ActivationPolicy):
     """A policy that never activates."""
 
@@ -1736,16 +1892,15 @@ def policy_from_env(
     if (
         policy_name in ("pdm_oracle", "pdm-oracle", "pdmoracle") or
         _strtobool(os.environ.get("PDM_ORACLE_STEERING")) or
-        _strtobool(os.environ.get("PDM_ORACLE_POLICY"))
-    ):
-        return PDMOraclePolicy.from_env()
-
-    if (
+        _strtobool(os.environ.get("PDM_ORACLE_POLICY")) or
         policy_name == "oracle" or
         _strtobool(os.environ.get("ORACLE_STEERING")) or
         _strtobool(os.environ.get("ORACLE_POLICY"))
     ):
         return PDMOraclePolicy.from_env()
+
+    if policy_name == "pdm_oracle_break_only" or policy_name == "oracle_break_only":
+        return PDMOracleBreakOnlyPolicy.from_env()
 
     alpha = float(os.environ.get("STEERING_ALPHA",
                   os.environ.get("ACTIVATION_ALPHA", 0.0)))

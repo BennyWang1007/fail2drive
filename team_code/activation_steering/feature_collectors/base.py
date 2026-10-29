@@ -19,6 +19,7 @@ class FeatureCollector(ABC):
         # self.output_root = self.resolve_model_root(self.output_root, model_idx)
         self.model_idx = model_idx
         self._fused_feature: torch.Tensor | None = None
+        self._root = Path(output_root)
 
     def set_fused_feature(self, fused_features: torch.Tensor) -> None:
         """Set fused features for collection, to be saved later."""
