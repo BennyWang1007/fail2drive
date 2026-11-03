@@ -14,6 +14,9 @@ FAIL2DRIVE_JOB_PREFIX = "Fail2Drive_"
 MAX_JOBS_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "eval_num_jobs.txt"
 )
+# [MODIFIED] Global variable to store CLI override for maximum parallel jobs
+CLI_MAX_PARALLEL_JOBS = None
+
 RETRYABLE_STATUSES = {
     "Failed - Agent couldn't be set up",
     # "Failed",
@@ -30,7 +33,12 @@ def job_name(job):
 # NOTE: Make sure to run this python script with the correct conda env which automatically sets the env vars.
 # If you have issues with the variables, such as WORK_DIR not being set, you can export them in the following bash file.
 def bash_file(
-    job, cfg, carla_world_port_start, carla_streaming_port_start, carla_tm_port_start
+    job,
+    cfg,
+    carla_world_port_start,
+    carla_streaming_port_start,
+    carla_tm_port_start,
+    model_port_start=40000,
 ):
     route = job["route"]
     route_id = job["route_id"]
@@ -41,11 +49,88 @@ def bash_file(
     err_file = job["err_file"]
     job_file = job["job_file"]
     env_var_cmd = cfg.get("env_var_cmd", "")
+    eval_mode = cfg.get("eval_mode", "none")
+    is_server = eval_mode in ("depth_ttc", "vlm")
+
+    cpus = 16 if is_server else 8
+    mem = "32G" if is_server else "16gb"
+    # time_limit = "24:00:00" if is_server else "4:00:00"
+    time_limit = "4:00:00"
+    GRES_MAPPING = {
+        # "vlm": "gpu:nvidia_geforce_rtx_4090:2",
+        "vlm": "gpu:2",
+        "depth_ttc": "gpu:2"
+    }
+    # gres = "gpu:nvidia_geforce_rtx_4090:2" if is_server else "gpu:1"
+    gres = GRES_MAPPING.get(eval_mode, "gpu:1")
+
     render_args = (
-        '-RenderOffScreen -graphicsadapter="${CARLA_GRAPHICS_ADAPTER:-$EVALUATOR_GPU}"'
+        '-RenderOffScreen -graphicsadapter="${CARLA_GRAPHICS_ADAPTER:-0}"'
         if cfg["rgb"]
         else "-nullrhi"
     )
+
+    server_setup = ""
+    carla_gpu_prefix = ""
+    if is_server:
+        carla_gpu_prefix = 'CUDA_VISIBLE_DEVICES="$EVAL_GPU" '
+        if eval_mode == "depth_ttc":
+            server_cmd = """export DEPTH_TTC_SERVER_URL="http://127.0.0.1:$FREE_MODEL_PORT/score"
+export DEPTH_TTC_DEBUG_DIR="${DEPTH_TTC_DEBUG_DIR:-$VIZ_PATH/depth_ttc_debug}"
+SERVER_LOG="$VIZ_PATH/depth_ttc_server_${SLURM_JOB_ID:-manual}.log"
+CUDA_VISIBLE_DEVICES="$SERVER_GPU" python -u "$F2D/tools/depth_ttc_server.py" \
+    --host 127.0.0.1 \
+    --port "$FREE_MODEL_PORT" \
+    --device cuda:0 \
+    --depth-anything-root "$DEPTH_ROOT" \
+    --checkpoint "$DEPTH_CHECKPOINT" \
+    >"$SERVER_LOG" 2>&1 &
+SERVER_PID=$!"""
+        else:  # vlm
+            server_cmd = """export VLM_SERVER_URL="http://127.0.0.1:$FREE_MODEL_PORT/generate"
+export ALPAMAYO_SERVER_URL="$VLM_SERVER_URL"
+export ALPAMAYO_RAW_LOG_PATH="${ALPAMAYO_RAW_LOG_PATH:-$VIZ_PATH/alpamayo_raw_responses.txt}"
+export ALPAMAYO_INPUT_SAVE_DIR="${ALPAMAYO_INPUT_SAVE_DIR:-$VIZ_PATH/alpamayo_inputs}"
+SERVER_LOG="$VIZ_PATH/alpamayo_server_${SLURM_JOB_ID:-manual}.log"
+CUDA_VISIBLE_DEVICES="$SERVER_GPU" "$ALPAMAYO_PY" -u "$F2D/tools/alpamayo_vlm_server.py" \
+    --host 127.0.0.1 \
+    --port "$FREE_MODEL_PORT" \
+    --device cuda:0 \
+    --model "$ALPAMAYO_MODEL" \
+    --alpamayo-version "$ALPAMAYO_VERSION" \
+    --max-new-tokens "$ALPAMAYO_MAX_NEW_TOKENS" \
+    --input-save-dir "$ALPAMAYO_INPUT_SAVE_DIR" \
+    --raw-log-path "$ALPAMAYO_RAW_LOG_PATH" \
+    >"$SERVER_LOG" 2>&1 &
+SERVER_PID=$!"""
+
+        server_setup = f"""
+IFS=',' read -r EVAL_GPU SERVER_GPU _ <<< "${{CUDA_VISIBLE_DEVICES:-0,1}}"
+echo "EVAL_GPU=$EVAL_GPU SERVER_GPU=$SERVER_GPU"
+
+FREE_MODEL_PORT=`comm -23 \
+    <(seq {model_port_start} {model_port_start + 49} | sort) \
+    <(ss -Htan | awk \'{{print $4}}\' | cut -d\':\' -f2 | sort -u) \
+    | shuf | head -n 1`
+echo 'Model Server Port:' $FREE_MODEL_PORT
+
+mkdir -p "$VIZ_PATH"
+{server_cmd}
+echo "Started {eval_mode} server pid=$SERVER_PID log=$SERVER_LOG"
+
+for _ in $(seq 1 180); do
+    if curl -sf "http://127.0.0.1:$FREE_MODEL_PORT/health" >/dev/null; then
+        echo "Server is ready."
+        break
+    fi
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "Server exited during startup:" >&2
+        tail -100 "$SERVER_LOG" >&2 || true
+        exit 1
+    fi
+    sleep 5
+done
+"""
 
     with open(job_file, "w", encoding="utf-8") as rsh:
         rsh.write(f"""#!/bin/bash
@@ -56,10 +141,10 @@ def bash_file(
 #SBATCH -e {err_file}
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=16gb
-#SBATCH --time=4:00:00
-#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task={cpus}
+#SBATCH --mem={mem}
+#SBATCH --time={time_limit}
+#SBATCH --gres={gres}
 #### SBATCH -w cp[14-15,17,20]
 #### SBATCH -C "[nvidia_geforce_rtx_3090|nvidia_geforce_rtx_3090_ti|nvidia_geforce_rtx_4080_super|nvidia_geforce_rtx_4090]"
 # NOTE: Partition and gres likely need to be updated for your cluster
@@ -81,6 +166,14 @@ printenv | sort
 nvidia-smi -L
 nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used --format=csv
 
+SERVER_PID=""
+CARLA_PID=""
+cleanup() {{
+    [ -n "$CARLA_PID" ] && kill "$CARLA_PID" 2>/dev/null || true
+    [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
+}}
+trap cleanup EXIT INT TERM
+{server_setup}
 FREE_WORLD_PORT=`comm -23 \
     <(seq {carla_world_port_start} {carla_world_port_start + 49} | sort) \
     <(ss -Htan | awk \'{{print $4}}\' | cut -d\':\' -f2 | sort -u) \
@@ -105,12 +198,12 @@ CARLA_LOG_DIR="${{TEST_OUTPUT:-{viz_path}}}/carla_log"
 mkdir -p "$CARLA_LOG_DIR"
 CARLA_LOG="$CARLA_LOG_DIR/carla_log_${{SLURM_JOB_ID:-manual}}.log"
 
-"$CARLA_ROOT/CarlaUE4.sh" \\
-    -carla-rpc-port="$FREE_WORLD_PORT" \\
-    -nosound \\
-    {render_args} \\
-    -carla-primary-port=0 \\
-    -carla-streaming-port="$FREE_STREAMING_PORT" \\
+{carla_gpu_prefix}"$CARLA_ROOT/CarlaUE4.sh" \
+    -carla-rpc-port="$FREE_WORLD_PORT" \
+    -nosound \
+    {render_args} \
+    -carla-primary-port=0 \
+    -carla-streaming-port="$FREE_STREAMING_PORT" \
     >"$CARLA_LOG" 2>&1 &
 
 CARLA_PID=$!
@@ -119,7 +212,7 @@ echo "Started CARLA pid=$CARLA_PID log=$CARLA_LOG"
 sleep 60  # Wait for CARLA to finish starting
 
 # NOTE: --track=MAP may have to be changed according to agent track
-python -u {cfg["lb_script"]} \
+{carla_gpu_prefix}python -u {cfg["lb_script"]} \
 --routes={route} \
 --repetitions=1 \
 --track=SENSORS \
@@ -148,9 +241,11 @@ def get_running_jobs():
             time.sleep(10)
 
     running = {}
+    # Exact prefix match, prevent a shorter prefix from matching jobs belonging to a longer prefix
+    exact_job_pattern = re.compile(rf"^{re.escape(FAIL2DRIVE_JOB_PREFIX)}\d+_[^_]+$")
     for line in out.splitlines():
         job_id, _, name = line.partition("|")
-        if name.strip().startswith(FAIL2DRIVE_JOB_PREFIX):
+        if exact_job_pattern.match(name.strip()):
             running[name.strip()] = job_id.strip()
     return running
 
@@ -202,6 +297,10 @@ def _retry_reason(evaluation_data):
 
 
 def get_max_num_parallel_jobs():
+    # [MODIFIED] Prioritize the CLI argument (--max-parallel-jobs) if provided
+    if CLI_MAX_PARALLEL_JOBS is not None:
+        return CLI_MAX_PARALLEL_JOBS
+
     try:
         with open(MAX_JOBS_FILE, "r", encoding="utf-8") as f:
             max_num_parallel_jobs = int(f.read().strip())
@@ -331,35 +430,44 @@ def kill_dead_jobs(jobs, running_jobs):
             any(["Watchdog exception" in line for line in lines])
             or "Engine crash handling finished; re-raising signal 11 for the default handler. Good bye.\n"
             in lines
-            or "[91mStopping the route, the agent has crashed:\n" in lines
-            or "[91mError during the simulation:\n" in lines
+            or " [91mStopping the route, the agent has crashed:\n" in lines
+            or " [91mError during the simulation:\n" in lines
+            or any(["The simulation took longer than" in line for line in lines])
         ):
 
             subprocess.Popen(f"scancel {job_id}", shell=True)
 
 
 if __name__ == "__main__":
+
+    default_mode = os.environ.get("ACTIVATION_POLICY", "none")
+    if default_mode not in ("depth_ttc", "vlm"):
+        default_mode = "none"
+
     parser = argparse.ArgumentParser()
+    parser.add_argument("--eval_mode", "--eval-mode", dest="eval_mode",
+                        choices=("none", "depth_ttc", "vlm"), default=default_mode,
+                        help="Evaluation mode: none (1 GPU), depth_ttc (2 GPUs), or vlm (2 GPUs)")
     parser.add_argument('--routes', type=str, default='fail2drive_split',
                         help='Path to folder containing the split route files')
-    parser.add_argument('--out_root', type=str, default='results/fail2drive',
+    parser.add_argument('--out_root', '--out-root', dest='out_root', type=str, default='results/fail2drive',
                         help='Path where results should be stored')
     parser.add_argument('--seeds', nargs='+', type=int, default=[1, 2, 3],
                         help='The seeds to evaluate')
-    parser.add_argument('--retries', type=int, default=2,
+    parser.add_argument('--retries', type=int, default=1,
                         help='Maximum number of retries per route')
-    parser.add_argument('--lb_script', type=str,
+    parser.add_argument('--lb_script', '--lb-script', dest='lb_script', type=str,
                         default='leaderboard/leaderboard/leaderboard_evaluator.py',
                         help='Path to leaderboard evaluator script')
-    parser.add_argument('--agent_file', type=str, default=None,
+    parser.add_argument('--agent_file', '--agent-file', dest='agent_file', type=str, default=None,
                         help='Path to agent entry file')
-    parser.add_argument('--agent_config', type=str, default=None,
+    parser.add_argument('--agent_config', '--agent-config', dest='agent_config', type=str, default=None,
                         help='Path to agent config/checkpoint')
     parser.add_argument('--no_rgb', action='store_true',
                         help='Disable RGB rendering and run with nullrhi')
-    parser.add_argument('--no_viz', action='store_true',
+    parser.add_argument('--no_viz', '--no-viz', dest='no_viz', action='store_true',
                         help='Disable VIZ_PATH output directory handling')
-    parser.add_argument('--env_var_cmd', type=str, default='',
+    parser.add_argument('--env_var_cmd', '--env-var-cmd', dest='env_var_cmd', type=str, default='',
                         help='Command to set environment variables for the job')
     parser.add_argument("--dry-run", action="store_true",
                         help="Print what would be submitted without executing sbatch")
@@ -368,8 +476,12 @@ if __name__ == "__main__":
     parser.add_argument("--max_rounds", type=int, default=5,
                         help="Max passes over all routes (each pass gives every unfinished route "
                              "--retries fresh tries). Stops earlier once everything is done.")
-    parser.add_argument("--job_prefix", type=str, default=FAIL2DRIVE_JOB_PREFIX,
+    parser.add_argument("--job_prefix", "--job-prefix", dest="job_prefix", type=str, default=FAIL2DRIVE_JOB_PREFIX,
                         help="Prefix for slurm job names (default: Fail2Drive_)")
+    # [MODIFIED] Add argument to override max parallel jobs per evaluator process
+    parser.add_argument("--max_parallel_jobs", "--max-parallel-jobs", dest="max_parallel_jobs",
+                        type=int, default=None,
+                        help="Maximum number of concurrent Slurm jobs for this evaluator (overrides eval_num_jobs.txt)")
 
     args = parser.parse_args()
     if not args.dry_run and (args.agent_file is None or args.agent_config is None):
@@ -385,14 +497,18 @@ if __name__ == "__main__":
     retries = args.retries
 
     cfg = {
+        "eval_mode": args.eval_mode,
         "lb_script": args.lb_script,
         "agent_file": args.agent_file,
         "agent_config": args.agent_config,
         # NOTE: If RGB is disabled here and the agent uses a camera, CARLA will crash
         "rgb": not args.no_rgb,
         "viz": not args.no_viz,
+        "env_var_cmd": args.env_var_cmd,
     }
     FAIL2DRIVE_JOB_PREFIX = args.job_prefix
+    # [MODIFIED] Set the global CLI override for max parallel jobs
+    CLI_MAX_PARALLEL_JOBS = args.max_parallel_jobs
 
     # Set of route IDs currently executing to exclude from the queue
     skip_route_ids = {
@@ -413,6 +529,10 @@ if __name__ == "__main__":
 
         for route in routes:
             route_id = route.split("_")[-1][:-4]
+
+            # Only run a subset of routes for testing purposes
+            # if route_id not in ("0000", "0001"):
+            #     continue
 
             # Skip jobs that are currently running
             if route_id in skip_route_ids:
@@ -457,9 +577,11 @@ if __name__ == "__main__":
     carla_world_ports = list(range(10000, 20000, 50))
     carla_streaming_ports = list(range(20000, 30000, 50))
     carla_tm_ports = list(range(30000, 40000, 50))
+    model_server_ports = list(range(40000, 50000, 50))
     random.shuffle(carla_world_ports)
     random.shuffle(carla_streaming_ports)
     random.shuffle(carla_tm_ports)
+    random.shuffle(model_server_ports)
     port_idx = 0
 
     # Submitting the jobs to slurm
@@ -505,6 +627,7 @@ if __name__ == "__main__":
                 carla_world_port_start = carla_world_ports[port_idx]
                 carla_streaming_port_start = carla_streaming_ports[port_idx]
                 carla_tm_port_start = carla_tm_ports[port_idx]
+                model_port_start = model_server_ports[port_idx]
                 port_idx += 1
                 port_idx %= 200
 
@@ -515,6 +638,7 @@ if __name__ == "__main__":
                     carla_world_port_start,
                     carla_streaming_port_start,
                     carla_tm_port_start,
+                    model_port_start,
                 )
 
                 # submit
