@@ -33,6 +33,7 @@ class VLMDecision:
     raw_response: str = ""
     timestamp: float = 0.0
     error: str = ""
+    valid: bool = True
 
 
 @dataclass
@@ -230,7 +231,8 @@ class AsyncVLMGate:
                 action="none",
                 reason="VLM initialization failed",
                 timestamp=time.time(),
-                error=f"{type(exc).__name__}: {exc}"))
+                error=f"{type(exc).__name__}: {exc}",
+                valid=False))
             print(
                 f"AsyncVLMGate failed to initialize:\n{traceback.format_exc()}", flush=True)
             return
@@ -255,7 +257,8 @@ class AsyncVLMGate:
                     action="none",
                     reason="VLM inference failed",
                     timestamp=time.time(),
-                    error=f"{type(exc).__name__}: {exc}")
+                    error=f"{type(exc).__name__}: {exc}",
+                    valid=False)
                 print(
                     f"AsyncVLMGate inference failed:\n{traceback.format_exc()}", flush=True)
 
@@ -424,8 +427,7 @@ class AsyncVLMGate:
 
         text = self._processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True)
-        inputs = self._processor(text=[text], images=[
-                                 image], return_tensors="pt")
+        inputs = self._processor(text=[text], images=[image], return_tensors="pt")
         inputs = {key: value.to(self._model.device) if hasattr(
             value, "to") else value for key, value in inputs.items()}
 
@@ -475,16 +477,23 @@ class AsyncVLMGate:
                 f"Alpamayo server request failed: {exc}") from exc
 
         raw_response = str(response_data.get("raw_response", ""))
-        if "action" in response_data:
-            parse_payload = {
-                "action": response_data.get("action"),
-                "confidence": response_data.get("confidence", 1.0),
-                "reason": response_data.get("reason", ""),
-            }
-            decision = self._parse_response(
-                json.dumps(parse_payload), request.frame_id)
+        action_value = response_data.get("action")
+        valid = response_data.get("valid", True)
+        allowed = {"none", "brake", "left", "right"}
+        if (valid is not True or not isinstance(action_value, str)
+                or action_value.strip().lower() not in allowed):
+            decision = VLMDecision(
+                frame_id=request.frame_id, enable_steering=False,
+                steering_alpha=0.0, action="none",
+                reason=str(response_data.get("reason", "Invalid Alpamayo decision"))[:240],
+                valid=False, error=str(response_data.get("error", "")))
         else:
-            decision = self._parse_response(raw_response, request.frame_id)
+            action = action_value.strip().lower()
+            alpha = 1.0 if action != "none" else 0.0
+            decision = VLMDecision(
+                frame_id=request.frame_id, enable_steering=alpha > 0.0,
+                steering_alpha=alpha, action=action,
+                reason=str(response_data.get("reason", ""))[:240], valid=True)
         decision.raw_response = raw_response or json.dumps(response_data)
         decision.timestamp = time.time()
         return decision
@@ -787,24 +796,50 @@ class AsyncVLMGate:
 
     def _parse_response(self, response: str, frame_id: int) -> VLMDecision:
         data = self._extract_json(response)
+        if self.backend == "alpamayo_server":
+            # Alpamayo 1.5 VQA must return an explicit action enum in JSON.
+            if not isinstance(data, dict):
+                return VLMDecision(
+                    frame_id=frame_id, enable_steering=False,
+                    steering_alpha=0.0, action="none",
+                    reason="Invalid or non-JSON Alpamayo 1.5 response",
+                    valid=False, raw_response=response)
+            action_value = data.get("action")
+            allowed = {"none", "brake", "left", "right"}
+            if not isinstance(action_value, str) or action_value.strip().lower() not in allowed:
+                action, valid = "none", False
+                reason = "Missing or invalid action field"
+            else:
+                action, valid = action_value.strip().lower(), True
+                reason = self._format_reason(data)
+            action = self._normalize_action(action)
+            alpha = 1.0 if action != "none" and valid else 0.0
+            return VLMDecision(
+                frame_id=frame_id, enable_steering=alpha > 0.0,
+                steering_alpha=alpha, action=action, reason=reason,
+                valid=valid, raw_response=response)
+
+        # Preserve the existing free-form action extraction for legacy R1 and
+        # non-Alpamayo backends. Alpamayo 1.5 is routed through alpamayo_server.
         if data is None:
             action = self._text_to_action(response)
             reason = response.strip()[:160]
+            valid = bool(response.strip())
         else:
             action = self._extract_action(data)
             confidence = self._extract_confidence(data)
+            valid = True
             if confidence is not None and confidence < self.confidence_threshold:
                 action = "none"
+                valid = False
             reason = self._format_reason(data)
 
         action = self._normalize_action(action)
-        steering_alpha = 1.0 if action != "none" else 0.0
+        alpha = 1.0 if action != "none" and valid else 0.0
         return VLMDecision(
-            frame_id=frame_id,
-            enable_steering=steering_alpha > 0.0,
-            steering_alpha=steering_alpha,
-            action=action,
-            reason=reason)
+            frame_id=frame_id, enable_steering=alpha > 0.0,
+            steering_alpha=alpha, action=action, reason=reason, valid=valid,
+            raw_response=response)
 
     @classmethod
     def _extract_command_alpha(cls, data: dict) -> float:
@@ -1073,7 +1108,10 @@ class AsyncVLMGate:
     def _resolve_backend(backend: str, model_name: str) -> str:
         backend = backend.lower()
         if backend == "auto":
-            if "alpamayo" in model_name.lower():
+            model_lower = model_name.lower()
+            if "alpamayo" in model_lower and ("1.5" in model_lower or "1_5" in model_lower):
+                return "alpamayo_server"
+            if "alpamayo" in model_lower:
                 return "alpamayo"
             if "internvl" in model_name.lower():
                 return "internvl"

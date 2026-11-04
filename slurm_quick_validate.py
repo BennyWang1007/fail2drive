@@ -40,20 +40,35 @@ DEPTH_CHECKPOINT = f"{DEPTH_ROOT}/metric_depth/checkpoints/depth_anything_v2_met
 # Edit the Slurm resources here.
 SBATCH_OPTIONS = {
     "partition": "devq",
-    "qos": "normal",
-    "time": "2:00:00",
-    # "qos": "debug",
-    # "time": "0:30:00",
+    # "qos": "normal",
+    # "time": "2:00:00",
+    "qos": "debug",
+    "time": "0:30:00",
     "nodes": "1",
     "ntasks": "1",
     "cpus-per-task": "8",
     "mem": "16gb",
-    "gres": "gpu:nvidia_geforce_rtx_4090:1",
+    # "gres": "gpu:nvidia_geforce_rtx_4090:1",
+    "gres": "gpu:1",
     # "exclusive": None,  # do not share the allocated GPU with another job
 }
 
 
-def build_tfv6_test(steering_feature: str, routes: str) -> str:
+def route_id_to_path(route_id: int) -> Path:
+    """Convert a route ID to a route XML path."""
+    for f in (REPO_ROOT / "fail2drive_split").glob("*.xml"):
+        # if f.stem[]
+        # if last 4 digits of f.stem match last 4 digits of route_id, return f
+        try:
+            int(f.stem[-4:])
+        except ValueError:
+            continue
+        if int(f.stem[-4:]) == route_id:
+            return f
+    raise ValueError(f"Route ID {route_id} not found.")
+
+
+def build_tfv6_test(steering_feature: str, routes: str | Path) -> str:
     return Rf'''PYTHONPATH="$REPO_ROOT/team_code:${{PYTHONPATH:-}}" \
     LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
     STEERING_FEATURE_NAME="{steering_feature}" \
@@ -154,12 +169,12 @@ class SlurmQuickValidateRun:
 
 def run_tfv6_test(
     steering_feature: str,
-    routes: str | list[str],
+    routes: str | Path | list[str | Path],
     profiles: list[str] | None = None,
     env_vars: dict[str, str] | None = None,
     dry_run: bool = False,
 ) -> None:
-    if isinstance(routes, str):
+    if isinstance(routes, str) or isinstance(routes, Path):
         routes = [routes]
 
     active_profiles = profiles if profiles is not None else ["common", "tfv6", "oracle", "debug"]
@@ -189,8 +204,8 @@ def run_tfv6_test(
             policy_name=policy_name,
             steering_feature=steering_feature,
         )
-        time.sleep(3)  # Avoid submitting too quickly to Slurm
         run_test(run, dry_run=dry_run)
+        time.sleep(3)  # Avoid submitting too quickly to Slurm
 
 
 def run_hipad_test(
@@ -230,8 +245,8 @@ def run_hipad_test(
             policy_name=policy_name,
             steering_feature=steering_feature,
         )
-        time.sleep(5)
         run_test(run, dry_run=dry_run)
+        time.sleep(3)  # Avoid submitting too quickly to Slurm
 
 
 # Edit, add, or remove entries here.  Each command is submitted as one
@@ -358,6 +373,7 @@ TESTS_TFV6: list[dict[str, Any]] = [
             "STEERING_VECTORS_DIR": f"{str(REPO_ROOT)}/steering/tfv6/post_process",
             "BENCHMARK_ROUTE_ID": "Generalization_PedestriansOnRoad_1085",
             "STEERING_FEATURE_NAME": "fused_features",
+            "ACTIVATION_POLICY": "fixed_after_frame",
             "STEERING_ALPHA": "1.5",
             "STEERING_COMMAND": "brake",
             "ACTIVATION_START_FRAME": "60",
@@ -374,6 +390,7 @@ TESTS_TFV6: list[dict[str, Any]] = [
             "STEERING_VECTORS_DIR": f"{REPO_ROOT}/steering/tfv6/post_process",
             "BENCHMARK_ROUTE_ID": "Generalization_PedestriansOnRoad_1085",
             "STEERING_FEATURE_NAME": "fused_features",
+            "ACTIVATION_POLICY": "fixed_after_frame",
             "STEERING_ALPHA": "1.1",
             "STEERING_COMMAND": "left",
             # "ACTIVATION_START_FRAME": "94",
@@ -386,10 +403,11 @@ TESTS_TFV6: list[dict[str, Any]] = [
     {
         "name": "f2d_tfv6_fused_fix_right_steering",
         "command": build_tfv6_test("fused_features", "./fail2drive_split/Generalization_PedestriansOnRoad_1085.xml"),
-        "profiles": ["common", "tfv6", "debug"],
+        "profiles": ["common", "tfv6", "fixed", "debug"],
         "env_vars": {
             "BENCHMARK_ROUTE_ID": "Generalization_PedestriansOnRoad_1085",
             "STEERING_FEATURE_NAME": "fused_features",
+            "ACTIVATION_POLICY": "fixed_after_frame",
             "STEERING_ALPHA": "1.1",
             "STEERING_COMMAND": "right",
             "ACTIVATION_START_FRAME": "92",
@@ -483,7 +501,87 @@ TESTS_TFV6: list[dict[str, Any]] = [
     #   --routes ./fail2drive_split/Base_RightOfWay_0056.xml \
     #   --port "$FREE_WORLD_PORT"''',
     #     },
+    # ================================ Override tests =================================
+    {
+        "name": "f2d_tfv6_override_fix_brake",
+        "command": build_tfv6_test("fused_features", "./fail2drive_split/Generalization_PedestriansOnRoad_1085.xml"),
+        "env": "fail2drive", "model_name": "tfv6", "policy_name": "fixed_override",
+        "profiles": ["common", "tfv6", "fixed", "override", "debug"],
+        "env_vars": {
+            "BENCHMARK_ROUTE_ID": "Generalization_PedestriansOnRoad_1085",
+            "STEERING_COMMAND": "brake",
+            "ACTIVATION_START_FRAME": "60",
+            "ACTIVATION_END_FRAME": "80",
+            "NO_OTHER_VEHICLES": "1",
+            "MAX_CARLA_FRAME": "150",
+        }
+    },
+    {
+        "name": "f2d_tfv6_override_fix_left_steering",
+        "command": build_tfv6_test("fused_features", "./fail2drive_split/Generalization_PedestriansOnRoad_1085.xml"),
+        "env": "fail2drive", "model_name": "tfv6", "policy_name": "fixed_override",
+        "profiles": ["common", "tfv6", "fixed", "override", "debug"],
+        "env_vars": {
+            "BENCHMARK_ROUTE_ID": "Generalization_PedestriansOnRoad_1085",
+            "STEERING_COMMAND": "left",
+            "ACTIVATION_START_FRAME": "91",
+            "ACTIVATION_END_FRAME": "100",
+            "NO_OTHER_VEHICLES": "1",
+            "MAX_CARLA_FRAME": "150",
+        }
+    },
+    {
+        "name": "f2d_tfv6_override_fix_right_steering",
+        "command": build_tfv6_test("fused_features", "./fail2drive_split/Generalization_PedestriansOnRoad_1085.xml"),
+        "env": "fail2drive", "model_name": "tfv6", "policy_name": "fixed_override",
+        "profiles": ["common", "tfv6", "fixed", "override", "debug"],
+        "env_vars": {
+            "BENCHMARK_ROUTE_ID": "Generalization_PedestriansOnRoad_1085",
+            "STEERING_COMMAND": "right",
+            "ACTIVATION_START_FRAME": "91",
+            "ACTIVATION_END_FRAME": "100",
+            "NO_OTHER_VEHICLES": "1",
+            "MAX_CARLA_FRAME": "150",
+        }
+    },
 ]
+
+
+def build_model_fixed_policy_run(
+    model_name: str,
+    steering_feature: str,
+    action: str,
+    env_vars: dict[str, str],
+    start_frame: int = 60,
+    duration: int = 20,
+    route: str = "./fail2drive_split/Generalization_PedestriansOnRoad_1085.xml",
+    policy_name: str = "fixed",
+    extra_profiles: list[str] | None = None,
+    log_name: str | None = None,
+) -> SlurmQuickValidateRun:
+    if model_name not in ["tfv6", "hipad"]:
+        raise ValueError(f"Unknown model_name: {model_name}")
+    cmd_fn = build_tfv6_test if model_name == "tfv6" else build_hipad_test
+    env = "hipad" if model_name == "hipad" else "fail2drive"
+    extra_env_vars = {
+        "BENCHMARK_ROUTE_ID": Path(route).stem,
+        "ACTIVATION_START_FRAME": str(start_frame),
+        "ACTIVATION_END_FRAME": str(start_frame + duration - 1),
+        "STEERING_COMMAND": action,
+        "MAX_CARLA_FRAME": str(start_frame + duration + 50),
+    }
+    return SlurmQuickValidateRun(
+        name=f"f2d_{model_name}_{policy_name}_{action}",
+        command=cmd_fn(steering_feature, route),
+        env=env,
+        profiles=["common", model_name, "fixed"] + (extra_profiles or []) + ["debug"],
+        env_vars={**extra_env_vars, **env_vars},
+        model_name=model_name,
+        policy_name=policy_name,
+        # steering_feature=steering_feature,
+        log_name=log_name,
+    )
+
 
 TESTS_HIPAD: list[dict[str, Any]] = [
     {
@@ -528,7 +626,50 @@ TESTS_HIPAD: list[dict[str, Any]] = [
         },
         # "log_name": "manual-all-alpha0.5",
         "log_name": "auto-all-alpha0.3",
-    }
+    },
+    # ================================= Override tests =================================
+    {
+        "name": "f2d_hipad_override_fix_brake",
+        "command": build_hipad_test("align_query", "./fail2drive_split/Generalization_PedestriansOnRoad_1085.xml"),
+        "env": "hipad", "model_name": "hipad", "policy_name": "fixed_override",
+        "profiles": ["common", "hipad", "fixed", "override", "debug"],
+        "env_vars": {
+            "BENCHMARK_ROUTE_ID": "Generalization_PedestriansOnRoad_1085",
+            "STEERING_COMMAND": "brake",
+            "ACTIVATION_START_FRAME": "60",
+            "ACTIVATION_END_FRAME": "80",
+            "NO_OTHER_VEHICLES": "1",
+            "MAX_CARLA_FRAME": "150",
+        }
+    },
+    {
+        "name": "f2d_hipad_override_fix_left_steering",
+        "command": build_hipad_test("align_query", "./fail2drive_split/Generalization_PedestriansOnRoad_1085.xml"),
+        "env": "hipad", "model_name": "hipad", "policy_name": "fixed_override",
+        "profiles": ["common", "hipad", "fixed", "override", "debug"],
+        "env_vars": {
+            "BENCHMARK_ROUTE_ID": "Generalization_PedestriansOnRoad_1085",
+            "STEERING_COMMAND": "left",
+            "ACTIVATION_START_FRAME": "91",
+            "ACTIVATION_END_FRAME": "105",
+            "NO_OTHER_VEHICLES": "1",
+            "MAX_CARLA_FRAME": "150",
+        }
+    },
+    {
+        "name": "f2d_hipad_override_fix_right_steering",
+        "command": build_hipad_test("align_query", "./fail2drive_split/Generalization_PedestriansOnRoad_1085.xml"),
+        "env": "hipad", "model_name": "hipad", "policy_name": "fixed_override",
+        "profiles": ["common", "hipad", "fixed", "override", "debug"],
+        "env_vars": {
+            "BENCHMARK_ROUTE_ID": "Generalization_PedestriansOnRoad_1085",
+            "STEERING_COMMAND": "right",
+            "ACTIVATION_START_FRAME": "91",
+            "ACTIVATION_END_FRAME": "105",
+            "NO_OTHER_VEHICLES": "1",
+            "MAX_CARLA_FRAME": "150",
+        }
+    },
 ]
 
 
@@ -665,16 +806,14 @@ def make_job_script(run: SlurmQuickValidateRun, test_output: Path) -> str:
 
     # Add extra resources for VLM and Depth-TTC tests (checks both name and profiles)
     opts = dict(SBATCH_OPTIONS)
-    if (
-        "vlm" in run.name
-        or "depth" in run.name
-        or "vlm" in run.profiles
-        or "depth_ttc" in run.profiles
-    ):
+    is_vlm = "vlm" in run.name or "vlm" in run.profiles
+    is_depth_ttc = "depth" in run.name or "depth_ttc" in run.profiles
+    if is_vlm or is_depth_ttc:
+        gres = "gpu:nvidia_geforce_rtx_4090:2" if is_vlm else "gpu:2"
         opts.update({
             "cpus-per-task": "8",
             "mem": "48gb",
-            "gres": "gpu:nvidia_geforce_rtx_4090:2",
+            "gres": gres,
         })
 
     directives = "\n".join(
@@ -715,8 +854,11 @@ cd "$REPO_ROOT"
 # 2. Apply test-specific overrides
 {env_vars_str}
 
-BENCHMARK_ROUTE_ID="${{BENCHMARK_ROUTE_ID:-BENCHMARK_ROUTE_ID}}_${{SLURM_JOB_ID:-manual}}"
-echo "Job ID: ${{SLURM_JOB_ID:-manual}}"
+JOB_ID_STR="${{SLURM_JOB_ID:-manual}}"
+JOB_ID_NUM="${{SLURM_JOB_ID:-0}}"
+
+BENCHMARK_ROUTE_ID="${{BENCHMARK_ROUTE_ID:-BENCHMARK_ROUTE_ID}}_${{JOB_ID_STR}}"
+echo "Job ID: ${{JOB_ID_STR}}"
 echo "Node: $(hostname)"
 echo "Test: {name}"
 echo "Profiles: {run.profiles}"
@@ -733,9 +875,9 @@ free_port() {{
     | shuf | head -n 1
 }}
 
-WORLD_PORT_BASE=$((10000 + (SLURM_JOB_ID % 200) * 50))
-STREAMING_PORT_BASE=$((20000 + (SLURM_JOB_ID % 200) * 50))
-TM_PORT_BASE=$((30000 + (SLURM_JOB_ID % 200) * 50))
+WORLD_PORT_BASE=$((10000 + (JOB_ID_NUM % 200) * 50))
+STREAMING_PORT_BASE=$((20000 + (JOB_ID_NUM % 200) * 50))
+TM_PORT_BASE=$((30000 + (JOB_ID_NUM % 200) * 50))
 
 FREE_WORLD_PORT=$(free_port "$WORLD_PORT_BASE")
 FREE_STREAMING_PORT=$(free_port "$STREAMING_PORT_BASE")
@@ -771,7 +913,7 @@ if [[ "${{VLM_BACKEND:-}}" == "alpamayo_server" ]]; then
     export HF_TOKEN
   fi
 
-  ALPAMAYO_PORT_BASE=$((5000 + (SLURM_JOB_ID % 100) * 50))
+  ALPAMAYO_PORT_BASE=$((5000 + (JOB_ID_NUM % 100) * 50))
   ALPAMAYO_PORT=$(free_port "$ALPAMAYO_PORT_BASE")
   if [[ -z "$ALPAMAYO_PORT" ]]; then
     echo "Could not find a free Alpamayo port near $ALPAMAYO_PORT_BASE" >&2
@@ -779,7 +921,16 @@ if [[ "${{VLM_BACKEND:-}}" == "alpamayo_server" ]]; then
   fi
   export ALPAMAYO_PORT
 
-  ALPAMAYO_LOG="$TEST_OUTPUT/alpamayo_server.log"
+  export ALPAMAYO_URL="http://${{ALPAMAYO_HOST:-127.0.0.1}}:$ALPAMAYO_PORT"
+  export VLM_SERVER_URL="$ALPAMAYO_URL/generate"
+  export ALPAMAYO_SERVER_URL="$VLM_SERVER_URL"
+
+  ALPAMAYO_OUT_DIR="$TEST_OUTPUT/alpamayo/${{JOB_ID_STR}}"
+  export ALPAMAYO_RAW_LOG_PATH="${{ALPAMAYO_RAW_LOG_PATH:-$ALPAMAYO_OUT_DIR/alpamayo_raw_responses.txt}}"
+  export ALPAMAYO_INPUT_SAVE_DIR="${{ALPAMAYO_INPUT_SAVE_DIR:-$ALPAMAYO_OUT_DIR/alpamayo_inputs}}"
+  mkdir -p "$ALPAMAYO_OUT_DIR" "$ALPAMAYO_INPUT_SAVE_DIR"
+  ALPAMAYO_LOG="$ALPAMAYO_OUT_DIR/alpamayo_server.log"
+
   CUDA_VISIBLE_DEVICES="$AUX_GPU" \
     "$ALPAMAYO_PY" "$REPO_ROOT/tools/alpamayo_vlm_server.py" \
       --host "${{ALPAMAYO_HOST:-127.0.0.1}}" \
@@ -788,10 +939,11 @@ if [[ "${{VLM_BACKEND:-}}" == "alpamayo_server" ]]; then
       --model "${{ALPAMAYO_MODEL:-nvidia/Alpamayo-1.5-10B}}" \
       --alpamayo-version "${{ALPAMAYO_VERSION:-1.5}}" \
       --max-new-tokens "${{ALPAMAYO_MAX_NEW_TOKENS:-256}}" \
+      --input-save-dir "$ALPAMAYO_INPUT_SAVE_DIR" \
+      --raw-log-path "$ALPAMAYO_RAW_LOG_PATH" \
       >"$ALPAMAYO_LOG" 2>&1 &
   ALPAMAYO_PID=$!
 
-  ALPAMAYO_URL="http://${{ALPAMAYO_HOST:-127.0.0.1}}:$ALPAMAYO_PORT"
   echo "Started Alpamayo server pid=$ALPAMAYO_PID port=$ALPAMAYO_PORT log=$ALPAMAYO_LOG"
   for _ in $(seq 1 180); do
     if curl -sf "$ALPAMAYO_URL/health" >/dev/null; then
@@ -809,15 +961,10 @@ if [[ "${{VLM_BACKEND:-}}" == "alpamayo_server" ]]; then
     tail -100 "$ALPAMAYO_LOG" >&2 || true
     exit 1
   fi
-  export VLM_SERVER_URL="$ALPAMAYO_URL/generate"
-  export ALPAMAYO_SERVER_URL="$VLM_SERVER_URL"
-  export ALPAMAYO_RAW_LOG_PATH="${{ALPAMAYO_RAW_LOG_PATH:-$TEST_OUTPUT/alpamayo_raw_responses.txt}}"
-  export ALPAMAYO_INPUT_SAVE_DIR="${{ALPAMAYO_INPUT_SAVE_DIR:-$TEST_OUTPUT/alpamayo_inputs}}"
-  mkdir -p "$ALPAMAYO_INPUT_SAVE_DIR"
 fi
 
 if [[ "${{ACTIVATION_POLICY:-}}" == "depth_ttc" || "${{STEERING_POLICY:-}}" == "depth_ttc" ]]; then
-  DEPTH_PORT_BASE=$((40000 + (SLURM_JOB_ID % 200) * 100))
+  DEPTH_PORT_BASE=$((40000 + (JOB_ID_NUM % 200) * 100))
   DEPTH_PORT=$(free_port "$DEPTH_PORT_BASE")
   if [[ -z "$DEPTH_PORT" ]]; then
     echo "Could not find a free Depth-TTC port near $DEPTH_PORT_BASE" >&2
@@ -853,14 +1000,14 @@ if [[ "${{ACTIVATION_POLICY:-}}" == "depth_ttc" || "${{STEERING_POLICY:-}}" == "
   echo "Depth-TTC server listening at $DEPTH_TTC_SERVER_URL"
 fi
 
+if [[ "${{VLM_BACKEND:-}}" == "alpamayo_server" || "${{ACTIVATION_POLICY:-}}" == "depth_ttc" || "${{STEERING_POLICY:-}}" == "depth_ttc" ]]; then
+  export CUDA_VISIBLE_DEVICES="$EVALUATOR_GPU"
+fi
+
 echo "Env vars:"
 # printenv | grep -E '^(REPO_ROOT|STEERING_|ACTIVATION_|PDM_|BENCHMARK_ROUTE_ID|NO_OTHER_VEHICLES|MAX_CARLA_FRAME|DEPTH_|.*_ACTIVATION_ALPHA_SCALE)' | sort
 printenv | sort
 echo
-
-if [[ "${{VLM_BACKEND:-}}" == "alpamayo_server" ]]; then
-  export CUDA_VISIBLE_DEVICES="$EVALUATOR_GPU"
-fi
 
 # For debugging GPU memory usage, print the GPU list and memory usage before starting CARLA.
 nvidia-smi -L; nvidia-smi --query-compute-apps=pid,used_memory --format=csv
@@ -868,7 +1015,7 @@ vulkaninfo --summary 2>&1 | grep -E 'deviceName|GPU[0-9]'
 
 CARLA_LOG_DIR="$TEST_OUTPUT/carla_log"
 mkdir -p "$CARLA_LOG_DIR"
-CARLA_LOG="$CARLA_LOG_DIR/carla_log_${{SLURM_JOB_ID:-manual}}.log"
+CARLA_LOG="$CARLA_LOG_DIR/carla_log_${{JOB_ID_STR}}.log"
 
 "$CARLA_ROOT/CarlaUE4.sh" \
   -carla-rpc-port="$FREE_WORLD_PORT" \
@@ -964,63 +1111,104 @@ def main() -> None:
         # "f2d_tfv6_depth_ttc_fused_BadParking_0002",
         # "f2d_hipad_fixed_1085_brake_all_layers",
         # "f2d_hipad_oracle_1095",
+
+        # "f2d_hipad_override_fix_brake",
+        # "f2d_hipad_override_fix_left_steering",
+        # "f2d_hipad_override_fix_right_steering",
+
+        # "f2d_tfv6_override_fix_brake",
+        # "f2d_tfv6_override_fix_left_steering",
+        # "f2d_tfv6_override_fix_right_steering",
     ]
 
     for run in RUNS:
         if safe_name(run.name) in names_to_test:
             run_test(run, dry_run=args.dry_run)
 
+    log_name = "Beta(3,6)-10frames"
+    fixed_test_settings = {
+        "extra_profiles": ["override"],
+        "policy_name": "fixed_override",
+        "env_vars": {"NO_OTHER_VEHICLES": "1"},
+        "log_name": log_name
+    }
+
+    # fixed_test_runs = [
+    #     # build_model_fixed_policy_run("tfv6", "fused_features", "brake", start_frame=61, duration=20, **fixed_test_settings),
+    #     build_model_fixed_policy_run("tfv6", "fused_features", "left", start_frame=10, duration=30, **fixed_test_settings),
+    #     # build_model_fixed_policy_run("tfv6", "fused_features", "right", start_frame=91, duration=15, **fixed_test_settings),
+
+    #     # build_model_fixed_policy_run("hipad", "align_query", "brake", start_frame=61, duration=20, **fixed_test_settings),
+    #     build_model_fixed_policy_run("hipad", "align_query", "left", start_frame=10, duration=30, **fixed_test_settings),
+    #     # build_model_fixed_policy_run("hipad", "align_query", "right", start_frame=91, duration=10, **fixed_test_settings)
+    # ]
+
+    # for run in fixed_test_runs:
+    #     run_test(run, dry_run=args.dry_run)
+
+    # exit(0)
+
     # test_hipad_steering_feature_runs(args.dry_run)
 
-    # run_tfv6_test(
-    #     steering_feature="fused_features",
-    #     # steering_feature="decoder_layer4",
-    #     # steering_feature="decoder_layer5",
-    #     # steering_feature="decoder_layer6",
-    #     routes=[
-    #         # "./fail2drive_split/Base_BadParking_0001.xml",
-    #         # "./fail2drive_split/Base_BadParking_0005.xml",
-    #         # "./fail2drive_split/Base_ConstructionPedestrian_0010.xml",
-    #         # "./fail2drive_split/Base_ConstructionPedestrian_0011.xml",
-    #         "./fail2drive_split/Base_ConstructionPedestrian_0012.xml",  # pass but slow
-    #         # "./fail2drive_split/Base_ConstructionPedestrian_0013.xml",  # fail
-    #         # "./fail2drive_split/Base_ConstructionPedestrian_0014.xml",
-    #         # "./fail2drive_split/Base_CustomObstacles_0020.xml",
-    #         # "./fail2drive_split/Base_CustomObstacles_0021.xml",
-    #         # "./fail2drive_split/Base_HardBrake_0036.xml",  # test for emergency brake
-    #         # "./fail2drive_split/Generalization_Wall_1096.xml",
-    #         # "./fail2drive_split/Generalization_Wall_1095.xml",
-    #     ],
-    #     profiles=["common", "tfv6", "oracle", "debug"],
-    #     env_vars={
-    #         "MAX_CARLA_FRAME": "1600",
-    #     },
-    #     dry_run=args.dry_run,
-    # )
-
-    run_hipad_test(
-        steering_feature="align_query",
+    run_tfv6_test(
+        steering_feature="fused_features",
+        # steering_feature="decoder_layer4",
+        # steering_feature="decoder_layer5",
+        # steering_feature="decoder_layer6",
         routes=[
             # "./fail2drive_split/Base_BadParking_0001.xml",
-            "./fail2drive_split/Base_BadParking_0004.xml",
+            # "./fail2drive_split/Base_BadParking_0004.xml",
             # "./fail2drive_split/Base_BadParking_0005.xml",
             # "./fail2drive_split/Base_ConstructionPedestrian_0010.xml",
             # "./fail2drive_split/Base_ConstructionPedestrian_0011.xml",
-            # "./fail2drive_split/Base_ConstructionPedestrian_0012.xml",
-            # "./fail2drive_split/Base_ConstructionPedestrian_0013.xml",
+            # "./fail2drive_split/Base_ConstructionPedestrian_0012.xml",  # pass but slow
+            # "./fail2drive_split/Base_ConstructionPedestrian_0013.xml",  # fail
             # "./fail2drive_split/Base_ConstructionPedestrian_0014.xml",
-            "./fail2drive_split/Base_ConstructionPedestrian_0016.xml",
             # "./fail2drive_split/Base_CustomObstacles_0020.xml",
             # "./fail2drive_split/Base_CustomObstacles_0021.xml",
             # "./fail2drive_split/Base_HardBrake_0036.xml",  # test for emergency brake
             # "./fail2drive_split/Generalization_Wall_1096.xml",
+            # "./fail2drive_split/Generalization_Wall_1095.xml",
+            "./fail2drive_split/Generalization_ConstructionPedestrian_1013.xml",
+            # "./fail2drive_split/Generalization_ConstructionPermutations_1018.xml",
+            route_id_to_path(1072),
+            route_id_to_path(1085),
         ],
-        profiles=["common", "hipad", "oracle", "debug"],
+        profiles=["common", "tfv6", "oracle", "new_oracle", "override", "debug"],
         env_vars={
-            "MAX_CARLA_FRAME": "1100",
+            "MAX_CARLA_FRAME": "600",
         },
         dry_run=args.dry_run,
     )
+
+    # run_hipad_test(
+    #     steering_feature="align_query",
+    #     routes=[
+    #         # "./fail2drive_split/Base_BadParking_0001.xml",
+    #         "./fail2drive_split/Base_BadParking_0004.xml",
+    #         # "./fail2drive_split/Base_BadParking_0005.xml",
+    #         # "./fail2drive_split/Base_ConstructionPedestrian_0010.xml",
+    #         # "./fail2drive_split/Base_ConstructionPedestrian_0011.xml",
+    #         "./fail2drive_split/Base_ConstructionPedestrian_0012.xml",
+    #         # "./fail2drive_split/Base_ConstructionPedestrian_0013.xml",
+    #         # "./fail2drive_split/Base_ConstructionPedestrian_0014.xml",
+    #         # "./fail2drive_split/Base_ConstructionPedestrian_0016.xml",
+    #         # "./fail2drive_split/Base_CustomObstacles_0020.xml",
+    #         "./fail2drive_split/Base_CustomObstacles_0021.xml",
+    #         # "./fail2drive_split/Base_HardBrake_0036.xml",  # test for emergency brake
+    #         # "./fail2drive_split/Generalization_Wall_1096.xml",
+    #     ],
+    #     profiles=["common", "hipad",
+    #               "oracle",
+    #             #   "depth_ttc",
+    #             #   "vlm",
+    #               "override",
+    #               "debug"],
+    #     env_vars={
+    #         "MAX_CARLA_FRAME": "1100",
+    #     },
+    #     dry_run=args.dry_run,
+    # )
 
 
 if __name__ == "__main__":

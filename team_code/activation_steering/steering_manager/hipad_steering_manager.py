@@ -131,6 +131,9 @@ class HiPADSteeringManager(BaseSteeringManager):
             "right": "legacy",
         }
 
+        if len(set(_vector_from.values())) > 1:
+            print("[HiPADSteeringManager] The mistmatch of vector sources is intentional")
+
         roots: dict[str, Path] = {}
 
         for a, method in _vector_from.items():

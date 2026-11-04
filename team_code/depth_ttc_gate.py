@@ -72,7 +72,17 @@ class DepthTTCClient:
         ego_extent: Optional[dict] = None,
         trajectory_times: Optional[dict[str, list]] = None,
         planner_candidates: Optional[dict] = None,
+        radar: Optional[list | np.ndarray] = None,
     ) -> DepthTTCDecision:
+
+        # 處理 radar 格式確保可轉為 JSON
+        radar_payload = None
+        # if radar is not None:
+        #     if hasattr(radar, "tolist"):
+        #         radar_payload = radar.tolist()
+        #     else:
+        #         radar_payload = radar
+
         payload = {
             "frame_id": int(frame_id),
             "image_base64": self._image_to_base64_png(rgb_image),
@@ -83,6 +93,7 @@ class DepthTTCClient:
             "horizon_s": self.horizon_s,
             "camera": camera or {},
             "ego_extent": ego_extent or {},
+            "radar": radar_payload,
         }
         body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(

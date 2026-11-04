@@ -21,10 +21,15 @@ from PIL import Image
 from depth_ttc_gate import DepthTTCClient
 from vlm_gate import AsyncVLMGate
 from activation_steering.policy import (
+    ActivationPolicy,
     DepthTTCPolicy,
+    NoPolicy,
     depth_ttc_enabled_from_env,
     vlm_enabled_from_env,
     policy_from_env,
+    steering_override_enabled_from_env,
+    classify_override_alpha,
+    OverrideTrajectory,
 )
 from activation_steering.feature_collectors.hipad_feature_collector import HiPADFeatureCollector
 from activation_steering.steering_manager.hipad_steering_manager import HiPADSteeringManager
@@ -125,12 +130,19 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
         self.steering_manager_alpha = None
         self._steering_hooks = []
         self._steering_vectors = {}
-        self.activation_policy = None
+        self.activation_policy = NoPolicy()
         self.depth_ttc_client = None
         self._depth_ttc_input = None  # raw CARLA input_data of the step being executed
         self._depth_ttc_busy = False  # True while candidate forwards run inside the model pre-hook
         self._depth_ttc_expected = None  # plan of the selected candidate, to verify the real forward
         self._depth_ttc_snapshot_s = None
+
+        # STEERING_OVERRIDE (ablation): no activation steering. alpha -> direct override:
+        #   brake      -> throttle 0 / brake 1 on the final control
+        #   left/right -> plan lateral replaced by a template before it reaches the PID controller
+        self.steering_override = steering_override_enabled_from_env()
+        self.override_traj = None
+        self._override_action = None
 
         self.vlm_steering = False
         self.depth_ttc_steering = False
@@ -154,22 +166,25 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
         self.legacy_hooks = _env_flag("HIPAD_LEGACY_HOOKS", "0")
 
         # activation_steering
-        self.activation_steering = os.environ.get("STEERING_VECTORS_DIR") is not None
+        # In override mode the policy still has to run (it produces the alpha), but no vectors are needed.
+        self.activation_steering = (
+            os.environ.get("STEERING_VECTORS_DIR") is not None or self.steering_override
+        )
         self.activation_action_log = None
         self.hipad_activation_alpha = None
         self.hipad_activation_plan_shift = 0.0
 
         if self.activation_steering:
-            print("[Fail2DriveHiPADAgent] Activation steering enabled (STEERING_VECTORS_DIR is set).", flush=True)
+            print("[Fail2DriveHiPADAgent] Activation steering enabled (STEERING_VECTORS_DIR is set).")
             # Same order as SensorAgent.setup: the Depth-TTC policy needs its client (it talks to the
             # depth server started by the job script); policy_from_env raises without it.
             self.depth_ttc_steering = depth_ttc_enabled_from_env()
             self.vlm_steering = vlm_enabled_from_env()
-            print("[Fail2DriveHiPADAgent] DEPTH_TTC_STEERING:", self.depth_ttc_steering, flush=True)
-            print("[Fail2DriveHiPADAgent] VLM_STEERING:", self.vlm_steering, flush=True)
+            print("[Fail2DriveHiPADAgent] DEPTH_TTC_STEERING:", self.depth_ttc_steering)
+            print("[Fail2DriveHiPADAgent] VLM_STEERING:", self.vlm_steering)
             if self.depth_ttc_steering:
                 self.depth_ttc_client = DepthTTCClient.from_env()
-                print(f"[Fail2DriveHiPADAgent] Depth TTC server: {self.depth_ttc_client.server_url}", flush=True)
+                print(f"[Fail2DriveHiPADAgent] Depth TTC server: {self.depth_ttc_client.server_url}")
             self.activation_policy = policy_from_env(
                 vlm_enabled=self.vlm_steering,
                 depth_ttc_client=self.depth_ttc_client,
@@ -209,8 +224,10 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
         self._configure_visual_output_path()
         if not self.legacy_hooks:
             self._setup_feature_collector()  # attach first: its pre-hook sees the un-steered inputs
-            if self.activation_steering:
+            if self.activation_steering and not self.steering_override:
                 self._setup_steering_manager()  # attach second: its pre-hook then shifts the plan inputs
+        if self.steering_override:
+            self._setup_override()
         if isinstance(self.activation_policy, DepthTTCPolicy):
             self._setup_depth_ttc()
         if self.vlm_steering:
@@ -332,7 +349,7 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
         alpha = self.activation_policy.alpha(frame, decision, decision_age_frames=age)
         if self.vlm_gate.verbose:
             if decision is None:
-                print(f"[VLMGate] use step={frame} no completed decision yet", flush=True)
+                print(f"[VLMGate] use step={frame} no completed decision yet")
             elif self._alpha_active(alpha):
                 print(
                     f"[VLMGate] use step={frame} decision_frame={decision.frame_id} "
@@ -388,10 +405,10 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
         )
 
     def _setup_depth_ttc(self):
-        if self.legacy_hooks or self.steering_manager is None:
+        if self.legacy_hooks or (self.steering_manager is None and not self.steering_override):
             raise ValueError(
-                "Depth-TTC needs agent-side steering: set HIPAD_LEGACY_HOOKS=0 and provide "
-                "STEERING_VECTORS_DIR with brake/left/right vectors."
+                "Depth-TTC needs agent-side steering (HIPAD_LEGACY_HOOKS=0 and STEERING_VECTORS_DIR "
+                "with brake/left/right vectors) or STEERING_OVERRIDE=1."
             )
         try:
             # Works on PyTorch >= 1.13
@@ -465,17 +482,25 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
         pts = np.vstack([np.zeros((1, 2), dtype=pts.dtype), pts])
         return float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum() / (len(pts) - 1) / _PLAN_DT)
 
-    def _candidate_prediction(self, outputs):
+    def _candidate_prediction(self, outputs, override_action=None):
         """HiP-AD model output -> the two fields DepthTTCPolicy._planner_candidates() reads.
 
         pred_route: spatial plan (path), pred_target_speed_distribution: one-hot of the temporal plan's speed
         (so the server's uncertainty terms are zero for HiP-AD candidates).
+        override_action (STEERING_OVERRIDE): "left"/"right" rewrite the plans' lateral, "brake" zeroes the
+        temporal plan (speed 0). `plan_temp` in the result stays the RAW model output (re-entrancy check).
         """
         bbox = outputs[0]["img_bbox"]
         plan_temp = bbox.get(_PLAN_TEMP)
         if plan_temp is None:
             return None  # the policy skips candidates without a route -> scoring is skipped
         plan_route = bbox.get(_PLAN_SPAT, plan_temp)
+        raw_plan_temp = plan_temp.detach().float().cpu().numpy()
+        if override_action in ("left", "right"):
+            plan_temp = self._override_plan_tensor(plan_temp, override_action)
+            plan_route = self._override_plan_tensor(plan_route, override_action)
+        elif override_action == "brake":
+            plan_temp = torch.zeros_like(plan_temp)  # all points at the ego origin -> speed 0
         route = plan_route.detach().float().cpu()[:, :2]
         if _DEPTH_TTC_SWAP_XY:
             route = route[:, [1, 0]]
@@ -485,7 +510,7 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
         return types.SimpleNamespace(
             pred_route=route,
             pred_target_speed_distribution=speed_probs,
-            plan_temp=plan_temp.detach().float().cpu().numpy(),
+            plan_temp=raw_plan_temp,
         )
 
     def _depth_ttc_pre_hook(self, module, args, kwargs):
@@ -516,15 +541,26 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
                 self._depth_ttc_snapshot_s = time.perf_counter() - started
                 print(f"[Fail2DriveHiPADAgent] model state snapshot took {self._depth_ttc_snapshot_s * 1000:.0f} ms")
         plans = {}
+        base = {}  # override mode: un-steered model outputs, computed once per decide()
 
         def predict(alpha):
             if not run_candidates:
                 return None
-            if snapshot is not None:
-                self._restore_model_state(snapshot)  # every candidate sees the state of the previous frame
-            self._steering_vectors = steering_manager.get_layer_vectors(alpha)
-            call_args, call_kwargs = copy.deepcopy((args, kwargs))  # the model may edit its inputs in place
-            prediction = self._candidate_prediction(self.model(*call_args, **call_kwargs))
+            if self.steering_override:
+                # alpha is not injected; one shared un-steered forward, then a per-candidate plan edit
+                if "outputs" not in base:
+                    if snapshot is not None:
+                        self._restore_model_state(snapshot)
+                    self._steering_vectors = {}
+                    call_args, call_kwargs = copy.deepcopy((args, kwargs))
+                    base["outputs"] = self.model(*call_args, **call_kwargs)
+                prediction = self._candidate_prediction(base["outputs"], classify_override_alpha(alpha))
+            else:
+                if snapshot is not None:
+                    self._restore_model_state(snapshot)  # every candidate sees the state of the previous frame
+                self._steering_vectors = steering_manager.get_layer_vectors(alpha)
+                call_args, call_kwargs = copy.deepcopy((args, kwargs))  # the model may edit its inputs in place
+                prediction = self._candidate_prediction(self.model(*call_args, **call_kwargs))
             plans[tuple(float(a) for a in alpha)] = None if prediction is None else prediction.plan_temp
             return prediction
 
@@ -540,11 +576,48 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
 
         alpha = decision.alpha
         self.hipad_activation_alpha = alpha
+        if self.steering_override:
+            # read by the control_pid wrapper (left/right) and by run_step (brake)
+            self._override_action = classify_override_alpha(alpha)
+            self._steering_vectors = {}
+            self.steering_manager_alpha = None
+            self._depth_ttc_expected = plans.get(tuple(float(a) for a in alpha))
+            return
         self._steering_vectors = steering_manager.get_layer_vectors(alpha)
         self.steering_manager_alpha = steering_manager.get_steering_alphas(alpha)
         if not any(a > 0.0 for a in self.steering_manager_alpha):
             self.steering_manager_alpha = None
         self._depth_ttc_expected = plans.get(tuple(float(a) for a in alpha))
+
+    # ------------------------------------------------------------------ STEERING_OVERRIDE
+    def _setup_override(self):
+        self.override_traj = OverrideTrajectory.from_env()
+        orig_control_pid = self.pidcontroller.control_pid
+
+        def control_pid(pred_temp, pred_spat, speed, target_point):
+            if self._override_action in ("left", "right"):
+                pred_temp = self._override_plan(pred_temp, self._override_action)
+                pred_spat = self._override_plan(pred_spat, self._override_action)
+            return orig_control_pid(pred_temp, pred_spat, speed, target_point)
+
+        self.pidcontroller.control_pid = control_pid
+        print(
+            "[Fail2DriveHiPADAgent] STEERING_OVERRIDE enabled (activation steering off, "
+            f"depth_ttc={self.depth_ttc_steering})",
+            flush=True,
+        )
+
+    def _override_plan(self, plan, side):
+        """plan: (N, 2) lidar frame [x right, y forward]. Keep y (progress), replace x (lateral, right +)."""
+        if plan is None:
+            return None
+        out = np.array(plan, dtype=np.float32, copy=True)
+        out[:, 0] = self.override_traj.lateral(out[:, 1], side)
+        return out
+
+    def _override_plan_tensor(self, plan, side):
+        arr = self._override_plan(plan.detach().float().cpu().numpy(), side)
+        return torch.as_tensor(arr, device=plan.device, dtype=plan.dtype)
 
     def _check_depth_ttc_forward(self):
         """The real forward must reproduce the selected candidate's plan; if not, candidate forwards
@@ -695,14 +768,21 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
         if _env_flag("HIPAD_AGENT_VERBOSE"):
             print(f"[Fail2DriveHiPADAgent] run_step called at step {getattr(self, 'step', -1)}")
         self._set_plan_feature_env()
+        self._override_action = None
         if self.activation_steering:
-            self._set_activation_env()
+            self._activation_steering_step()
         self._depth_ttc_input = input_data
         self._depth_ttc_expected = None
         try:
             control = super().run_step(input_data, timestamp)
         finally:
             self._depth_ttc_input = None
+        if self._override_action == "brake":
+            # hard override on the final control (base run_step already stored the same object in prev_control)
+            control.throttle = 0.0
+            control.brake = 1.0
+            self.pid_metadata["throttle"] = 0.0
+            self.pid_metadata["brake"] = 1.0
         self._steering_vectors = {}  # never leak vectors into the next forward pass
         self._check_depth_ttc_forward()
         if self.vlm_gate is not None and self._last_tick_data is not None:
@@ -719,7 +799,7 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
             os.environ["HIPAD_PLAN_FEATURE_RUN_ID"] = self.save_path.name
         os.environ["HIPAD_PLAN_FEATURE_FRAME"] = str(int(getattr(self, "step", -1)) + 1)
 
-    def _set_activation_env(self):
+    def _activation_steering_step(self):
         frame = int(getattr(self, "step", -1)) + 1
         if isinstance(self.activation_policy, DepthTTCPolicy):
             # The alpha is decided inside the model pre-hook (_depth_ttc_pre_hook): decide() needs the
@@ -738,6 +818,18 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
         else:
             self.hipad_activation_alpha = self.activation_policy.alpha(frame)
 
+        if self.steering_override:
+            self._override_action = classify_override_alpha(self.hipad_activation_alpha)
+            os.environ["HIPAD_ACTIVATION_ALPHA"] = "0.0"  # in-model injector off
+            os.environ["HIPAD_ACTIVATION_PLAN_SHIFT"] = "0.0"
+            self._steering_vectors = {}
+            self.steering_manager_alpha = None
+            self.hipad_activation_plan_shift = 0.0
+            if self._override_action is not None:
+                print(f"[Fail2DriveHiPADAgent] Override action at frame {frame}: {self._override_action}"
+                      f" (alpha={self.hipad_activation_alpha})")
+            return
+
         if self.legacy_hooks:
             os.environ["HIPAD_ACTIVATION_ALPHA"] = self._format_activation_alpha(self.hipad_activation_alpha)
             print(
@@ -747,11 +839,12 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
         else:
             # The agent-side hooks inject now; keep the in-model ActivationInjector off (alpha=0)
             # so the vectors are not added twice.
-            assert self.steering_manager is not None, "Steering manager must be initialized when legacy_hooks=False"
+            manager = cast(HiPADSteeringManager, self.steering_manager)
             os.environ["HIPAD_ACTIVATION_ALPHA"] = "0.0"
-            steering_alphas = self.steering_manager.get_steering_alphas(self.hipad_activation_alpha)
-            print(f"[Fail2DriveHiPADAgent] Activation alpha at frame {frame}: {steering_alphas}", flush=True)
-            self._steering_vectors = self.steering_manager.get_layer_vectors(self.hipad_activation_alpha)
+            steering_alphas = manager.get_steering_alphas(self.hipad_activation_alpha)
+            if any(a > 0.0 for a in steering_alphas):
+                print(f"[Fail2DriveHiPADAgent] Activation alpha at frame {frame}: {steering_alphas}")
+            self._steering_vectors = manager.get_layer_vectors(self.hipad_activation_alpha)
             self.steering_manager_alpha = steering_alphas
             if not any(a > 0.0 for a in self.steering_manager_alpha):
                 self.steering_manager_alpha = None
@@ -1040,7 +1133,11 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
             return
         metadata = getattr(self, "pid_metadata", {})
         frame = int(getattr(self, "step", -1))
-        alpha = self.hipad_activation_alpha if self.legacy_hooks else self.steering_manager_alpha
+        alpha = (
+            self.hipad_activation_alpha
+            if (self.legacy_hooks or self.steering_override)
+            else self.steering_manager_alpha
+        )
         record = {
             "frame": frame,
             "speed": float(metadata.get("speed", 0.0)),
@@ -1058,6 +1155,7 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
             held = int(self.step) <= int(policy.active_until)  # active_candidate stays set after the hold expired
             record["depth_ttc_candidate"] = policy.active_candidate if held else "original"
             record["depth_ttc_active_until"] = int(policy.active_until)
+        record["override_action"] = self._override_action
         record.update(self._vlm_log_fields())
         with open(self.activation_action_log, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")

@@ -57,9 +57,10 @@ def bash_file(
     # time_limit = "24:00:00" if is_server else "4:00:00"
     time_limit = "4:00:00"
     GRES_MAPPING = {
-        # "vlm": "gpu:nvidia_geforce_rtx_4090:2",
-        "vlm": "gpu:2",
-        "depth_ttc": "gpu:2"
+        "vlm": "gpu:nvidia_geforce_rtx_4090:2",
+        # "vlm": "gpu:2",
+        # "depth_ttc": "gpu:2"
+        "depth_ttc": "gpu:nvidia_geforce_rtx_4090:2"
     }
     # gres = "gpu:nvidia_geforce_rtx_4090:2" if is_server else "gpu:1"
     gres = GRES_MAPPING.get(eval_mode, "gpu:1")

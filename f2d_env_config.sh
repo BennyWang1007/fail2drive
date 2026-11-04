@@ -59,17 +59,42 @@ env_tfv6() {
     export RIGHT_ACTIVATION_ALPHA_SCALE="1.1"  # 1.1 for fused/decoder4, 1.5 for decoder5, 0.9 for decoder6
 }
 
+
+env_tfv6_dec4() {
+    env_tfv6
+    export STEERING_FEATURE_NAME="decoder_layer4"
+    export STEERING_FEATURE_NAME_SHORT="decoder4"
+    export LEFT_ACTIVATION_ALPHA_SCALE="1.1"
+    export RIGHT_ACTIVATION_ALPHA_SCALE="1.1"
+}
+
+env_tfv6_dec5() {
+    env_tfv6
+    export STEERING_FEATURE_NAME="decoder_layer5"
+    export STEERING_FEATURE_NAME_SHORT="decoder5"
+    export LEFT_ACTIVATION_ALPHA_SCALE="1.5"
+    export RIGHT_ACTIVATION_ALPHA_SCALE="1.5"
+}
+
+env_tfv6_dec6() {
+    env_tfv6
+    export STEERING_FEATURE_NAME="decoder_layer6"
+    export STEERING_FEATURE_NAME_SHORT="decoder6"
+    export LEFT_ACTIVATION_ALPHA_SCALE="0.9"
+    export RIGHT_ACTIVATION_ALPHA_SCALE="0.9"
+}
+
 # ------------------------------------------------------------------------------
 # 3. Policy Presets (none / oracle / oracle_break_only / depth_ttc / vlm)
 # ------------------------------------------------------------------------------
 env_no_policy() {
-    export STEERING_POLICY="none"
     export ACTIVATION_POLICY="none"
+    export STEERING_POLICY="none"
 }
 
 env_oracle() {
-    export STEERING_POLICY="oracle"
     export ACTIVATION_POLICY="pdm_oracle"
+    export STEERING_POLICY="oracle"
     export PDM_ORACLE_ACTION="auto"
     export PDM_ORACLE_ALPHA="1.0"
     export PDM_ORACLE_TRIGGER_DISTANCE="20"
@@ -93,10 +118,20 @@ env_oracle() {
     export PDM_ORACLE_SAME_LANE_LATERAL_MARGIN="2.0"
 }
 
+env_new_oracle() {
+    PDM_ORACLE_CLOSED_LOOP=1
+    # optional
+    PDM_ORACLE_CL_ALPHA_MAX=3.0
+    PDM_ORACLE_CL_KP=0.8
+    PDM_ORACLE_CL_OVERSHOOT_MARGIN=1.0
+    PDM_ORACLE_CL_HEADING_SOFT_DEG=15
+    PDM_ORACLE_CL_HEADING_HARD_DEG=35
+}
+
 env_oracle_brake_only() {
     env_oracle
-    export STEERING_POLICY="oracle_brake_only"
     export ACTIVATION_POLICY="oracle_brake_only"
+    export STEERING_POLICY="oracle_brake_only"
 }
 
 env_depth_ttc() {
@@ -120,6 +155,10 @@ env_depth_ttc() {
 }
 
 env_vlm() {
+    export ACTIVATION_POLICY="vlm"
+    export STEERING_POLICY="vlm"
+    export VLM_STEERING="1"
+
     export ROOT="${ROOT:-$HOME}"
     export ALPAMAYO_ROOT="${ALPAMAYO_ROOT:-$ROOT/alpamayo1.5}"
     export ALPAMAYO_REPO="${ALPAMAYO_REPO:-$ALPAMAYO_ROOT}"
@@ -130,9 +169,7 @@ env_vlm() {
     export ALPAMAYO_DECISION_MODE="${ALPAMAYO_DECISION_MODE:-vqa}"
     export ALPAMAYO_HOST="${ALPAMAYO_HOST:-127.0.0.1}"
 
-    export VLM_STEERING="${VLM_STEERING:-1}"
     export VLM_BACKEND="${VLM_BACKEND:-alpamayo_server}"
-    export ACTIVATION_POLICY="${ACTIVATION_POLICY:-vlm}"
     export VLM_BRAKE_ALPHA="${VLM_BRAKE_ALPHA:-1.0}"
     export VLM_LATERAL_ALPHA="${VLM_LATERAL_ALPHA:-1.0}"
     export VLM_MIN_SPEED_MPS="${VLM_MIN_SPEED_MPS:-0.0}"
@@ -144,6 +181,19 @@ env_vlm() {
     if command -v hf >/dev/null 2>&1 && [ -z "${HF_TOKEN:-}" ]; then
         export HF_TOKEN="$(hf auth token 2>/dev/null || true)"
     fi
+}
+
+env_fixed() {
+    export ACTIVATION_POLICY="fixed_after_frame"
+    export STEERING_POLICY="fixed_after_frame"
+}
+
+env_override() {
+    export STEERING_OVERRIDE="1"
+    export STEERING_OVERRIDE_TRAJ_LEFT="${STEERING_OVERRIDE_TRAJ_LEFT:-0}"
+    export STEERING_OVERRIDE_TRAJ_RIGHT="${STEERING_OVERRIDE_TRAJ_RIGHT:-0}"
+    export STEERING_OVERRIDE_LATERAL="${STEERING_OVERRIDE_LATERAL:-3.5}"
+    export STEERING_OVERRIDE_LENGTH="${STEERING_OVERRIDE_LENGTH:-28.5}"
 }
 
 # ------------------------------------------------------------------------------
@@ -166,11 +216,17 @@ load_f2d_env() {
             common)            env_common ;;
             hipad)             env_hipad ;;
             tfv6)              env_tfv6 ;;
+            tfv6_dec4)         env_tfv6_dec4 ;;
+            tfv6_dec5)         env_tfv6_dec5 ;;
+            tfv6_dec6)         env_tfv6_dec6 ;;
             none|no_policy)    env_no_policy ;;
             oracle)            env_oracle ;;
+            new_oracle)        env_new_oracle ;;
             oracle_brake_only) env_oracle_brake_only ;;
             depth_ttc)         env_depth_ttc ;;
             vlm)               env_vlm ;;
+            fixed|fixed_after_frame) env_fixed ;;
+            override)          env_override ;;
             debug)             env_debug ;;
             *)
                 echo "[f2d_env_config.sh] Error: Unknown profile '$profile'" >&2
