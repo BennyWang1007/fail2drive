@@ -23,6 +23,8 @@ class BaseSteeringManager:
     @staticmethod
     def _to_alpha_list(alpha: Alpha) -> AlphaVec:
         """Convert a single float or a list of floats into a 1D torch.Tensor."""
+        if alpha is None:
+            return [0.0, 0.0, 0.0]
         if isinstance(alpha, float):
             return [alpha, alpha, alpha]
         elif isinstance(alpha, List):

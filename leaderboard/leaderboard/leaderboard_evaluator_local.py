@@ -163,6 +163,10 @@ class LeaderboardEvaluator(object):
             sensor.stop()
             sensor.destroy()
 
+        import gc
+        self.agent_instance = None
+        gc.collect(); torch.cuda.empty_cache()
+
 
     def find_free_port(self, start_port=2_000, end_port=40_000):
         for port in range(start_port, end_port + 1):
@@ -271,6 +275,15 @@ class LeaderboardEvaluator(object):
         current_stats_record = self.statistics_manager.compute_route_statistics(
             route_date_string, route_index, self.manager.scenario_duration_system, self.manager.scenario_duration_game, crash_message
         )
+        # Persist before agent.destroy() generates videos or any other cleanup
+        # can hang. The batch watchdog may kill us during that postprocessing.
+        indexer = self._route_indexer
+        self.statistics_manager.save_progress(indexer.index, indexer.total)
+        self.statistics_manager.write_statistics()
+        if not indexer.peek() and crash_message != "Simulation crashed":
+            self.statistics_manager.compute_global_statistics()
+            self.statistics_manager.validate_and_write_statistics(self.sensors_initialized, False)
+        print("[Checkpoint] Route statistics saved before cleanup", flush=True)
         return current_stats_record
 
     def _load_and_run_scenario(self, args, config):
@@ -282,6 +295,7 @@ class LeaderboardEvaluator(object):
         """
         crash_message = ""
         entry_status = "Started"
+        route_date_string = config.name
 
         print("\n\033[1m========= Preparing {} (repetition {}) =========\033[0m".format(config.name, config.repetition_index))
 
@@ -303,7 +317,7 @@ class LeaderboardEvaluator(object):
             print(f"\n{traceback.format_exc()}\033[0m")
 
             entry_status, crash_message = FAILURE_MESSAGES["Simulation"]
-            self._register_statistics(config.index, entry_status, crash_message)
+            self._register_statistics(route_date_string, config.index, entry_status, crash_message)
             self._cleanup()
             return True
 
@@ -423,6 +437,7 @@ class LeaderboardEvaluator(object):
         Run the challenge mode
         """
         route_indexer = RouteIndexer(args.routes, args.repetitions, args.routes_subset)
+        self._route_indexer = route_indexer
 
         if args.resume:
             resume = route_indexer.validate_and_resume(args.checkpoint)

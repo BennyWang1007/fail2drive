@@ -8,6 +8,8 @@ import io
 import json
 import os
 import time
+import threading
+import copy
 from typing import Optional
 import urllib.error
 import urllib.request
@@ -159,3 +161,66 @@ class DepthTTCClient:
         buffer = io.BytesIO()
         Image.fromarray(array).save(buffer, format="PNG")
         return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+class AsyncDepthTTCClient(DepthTTCClient):
+    """One background HTTP request per agent; planner threads only submit/poll."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._lock = threading.Lock()
+        self._busy = False
+        self._closed = False
+        self._latest = None
+        self._thread = None
+        if self.verbose:
+            print(f"[DepthTTCAsync] enabled url={self.server_url} max_inflight=1", flush=True)
+
+    @property
+    def busy(self):
+        with self._lock:
+            return self._busy
+
+    def latest(self):
+        with self._lock:
+            return self._latest
+
+    def submit(self, **payload):
+        with self._lock:
+            if self._busy or self._closed:
+                return False
+            self._busy = True
+        try:
+            # Never hand mutable sensor buffers to a background worker.
+            payload = copy.deepcopy(payload)
+            self._thread = threading.Thread(
+                target=self._run_request, args=(payload,),
+                name="AsyncDepthTTC", daemon=True)
+            self._thread.start()
+        except Exception:
+            with self._lock:
+                self._busy = False
+            raise
+        return True
+
+    def _run_request(self, payload):
+        started = time.perf_counter()
+        try:
+            decision = self.score(**payload)
+        except Exception as exc:
+            decision = self._fallback(payload['frame_id'], f"{type(exc).__name__}: {exc}")
+        with self._lock:
+            if not self._closed:
+                self._latest = decision
+            self._busy = False
+        if self.verbose:
+            print(f"[DepthTTCAsync] result decision_frame={decision.frame_id} "
+                  f"elapsed_ms={(time.perf_counter() - started) * 1000:.1f} "
+                  f"selected={decision.selected_trajectory} error={decision.error}", flush=True)
+
+    def stop(self):
+        with self._lock:
+            self._closed = True
+            self._latest = None
+        if self._thread is not None:
+            self._thread.join(timeout=0.2)

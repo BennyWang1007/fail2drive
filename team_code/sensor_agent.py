@@ -30,7 +30,7 @@ from scipy.optimize import fsolve
 from scenario_logger import ScenarioLogger
 import transfuser_utils as t_u
 from vlm_gate import AsyncVLMGate
-from depth_ttc_gate import DepthTTCClient
+from depth_ttc_gate import AsyncDepthTTCClient
 from activation_steering.policy import policy_from_env
 
 import pathlib
@@ -184,7 +184,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
                 self.nets.append(net)
 
         if self.depth_ttc_steering:
-            self.depth_ttc_client = DepthTTCClient.from_env()
+            self.depth_ttc_client = AsyncDepthTTCClient.from_env()
             print(
                 f'Depth TTC steering enabled: {self.depth_ttc_client.server_url} '
                 f'horizon_s={self.depth_ttc_client.horizon_s} '
@@ -651,6 +651,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
         forward_candidates = [('original', steering_alpha)]
         depth_ttc_should_score = False
         if self.depth_ttc_client is not None:
+            self._depth_ttc_consume_latest()
+            selected_depth_candidate = self._depth_ttc_held_candidate()
             depth_ttc_should_score = self._depth_ttc_should_score(speed)
             if depth_ttc_should_score:
                 forward_candidates = self._depth_ttc_candidate_alphas()
@@ -763,13 +765,13 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
                 'pred_wp_1': pred_wp_1,
             }
 
-        selected_candidate = forward_candidates[0][0]
+        selected_candidate = (selected_depth_candidate if self.depth_ttc_client is not None
+                              else forward_candidates[0][0])
         if self.depth_ttc_client is not None and depth_ttc_should_score and len(candidate_results) > 1:
             planner_candidates = self._depth_ttc_planner_candidates_from_results(
                 candidate_results)
             if planner_candidates:
-                self.depth_ttc_last_score_frame = self.step
-                self.depth_ttc_last_decision = self.depth_ttc_client.score(
+                submitted = self.depth_ttc_client.submit(
                     frame_id=self.step,
                     rgb_image=tick_data['rgb_front_np'],
                     speed=speed,
@@ -783,17 +785,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
                         'uncertainty_weight': int(self.uncertainty_weight),
                         'brake_uncertainty_threshold': float(self.config.brake_uncertainty_threshold),
                     })
-                selected_candidate = getattr(
-                    self.depth_ttc_last_decision, 'selected_trajectory', 'original')
-                if selected_candidate not in candidate_results:
-                    selected_candidate = 'original'
-                self._depth_ttc_activate_candidate(selected_candidate)
-                if self.depth_ttc_client.verbose:
-                    print(
-                        f"[DepthTTC] use step={self.step} selected={selected_candidate} "
-                        f"action={getattr(self.depth_ttc_last_decision, 'action', 'none')} "
-                        f"active_until={self.depth_ttc_active_until}",
-                        flush=True)
+                if submitted:
+                    self.depth_ttc_last_score_frame = self.step
 
         selected_result = candidate_results[selected_candidate]
         steering_alpha = selected_result['steering_alpha']
@@ -1090,6 +1083,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
         return self._depth_ttc_candidate_alphas()[0][1]
 
     def _depth_ttc_should_score(self, speed):
+        if self.depth_ttc_client.busy:
+            return False
         min_speed = float(os.environ.get('DEPTH_TTC_MIN_SPEED_M_S', 0.0))
         if float(speed) < min_speed:
             return False
@@ -1104,6 +1099,20 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
             if candidate in ('brake', 'left', 'right'):
                 return candidate
         return 'original'
+
+    def _depth_ttc_consume_latest(self):
+        decision = self.depth_ttc_client.latest()
+        if decision is None:
+            return
+        previous = self.depth_ttc_last_decision
+        if previous is None or (decision.frame_id, decision.timestamp) != (previous.frame_id, previous.timestamp):
+            self.depth_ttc_last_decision = decision
+            self.depth_ttc_decision_start_frame = self.step
+            self._depth_ttc_activate_candidate(decision.selected_trajectory)
+        if self.depth_ttc_client.verbose and self.step <= self.depth_ttc_active_until:
+            print(f"[DepthTTC] use step={self.step} decision_frame={decision.frame_id} "
+                  f"age={self.step - self.depth_ttc_decision_start_frame} "
+                  f"selected={self._depth_ttc_held_candidate()} error={decision.error}", flush=True)
 
     def _depth_ttc_activate_candidate(self, candidate):
         candidate = str(candidate or 'original').lower()
@@ -1578,6 +1587,9 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
         if self.vlm_gate is not None:
             self.vlm_gate.stop()
+
+        if self.depth_ttc_client is not None:
+            self.depth_ttc_client.stop()
 
         del self.nets
         del self.config

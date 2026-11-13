@@ -124,11 +124,11 @@ class HiPADSteeringManager(BaseSteeringManager):
 
         # options: "auto", "manual", "legacy"
         _vector_from: dict[str, str] = {
-            "break": "manual",
-            # "left": "manual",
-            # "right": "manual",
-            "left": "legacy",
-            "right": "legacy",
+            "brake": "manual",
+            "left": "manual",
+            "right": "manual",
+            # "left": "legacy",
+            # "right": "legacy",
         }
 
         if len(set(_vector_from.values())) > 1:
@@ -155,9 +155,15 @@ class HiPADSteeringManager(BaseSteeringManager):
                 raise ValueError(f"Unknown vector_from method: {method}")
 
             print(f"[HiPADSteeringManager] Checking for steering vectors for action '{a}' in {cand_dir}")
-            if (cand_dir / self.feature_name).is_dir():
-                print(f"[HiPADSteeringManager] Found steering vectors for action '{a}' in {cand_dir}")
-                roots[a] = cand_dir
+
+            if method == "legacy":
+                if cand_dir.is_file():
+                    print(f"[HiPADSteeringManager] Found steering vectors for action '{a}' in {cand_dir}")
+                    roots[a] = cand_dir
+            else:
+                if (cand_dir / self.feature_name).is_dir():
+                    print(f"[HiPADSteeringManager] Found steering vectors for action '{a}' in {cand_dir}")
+                    roots[a] = cand_dir
 
         return roots
 

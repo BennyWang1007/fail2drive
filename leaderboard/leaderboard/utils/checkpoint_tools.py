@@ -5,6 +5,8 @@ except ImportError:
     import json
 import requests
 import os.path
+import stat
+import uuid
 
 
 def autodetect_proxy():
@@ -56,5 +58,18 @@ def save_dict(endpoint, data):
         else:
             _ = requests.patch(url=endpoint, headers={'content-type':'application/json'}, data=json.dumps(data, indent=4, sort_keys=True))
     else:
-        with open(endpoint, 'w') as fd:
-            json.dump(data, fd, indent=4)
+        # Never truncate a previously saved result: a watchdog/SIGKILL during
+        # serialization must leave either the old or the new complete file.
+        tmp_path = str(endpoint) + '.' + uuid.uuid4().hex + '.tmp'
+        try:
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+            with os.fdopen(fd, 'w') as stream:
+                if os.path.exists(endpoint):
+                    os.fchmod(stream.fileno(), stat.S_IMODE(os.stat(endpoint).st_mode))
+                json.dump(data, stream, indent=4)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp_path, endpoint)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)

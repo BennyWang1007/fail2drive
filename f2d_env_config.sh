@@ -11,14 +11,24 @@
 # ==============================================================================
 
 # Base paths (fall back to current working directory if F2D is not set)
-export F2D="${F2D:-$PWD}"
+# export F2D="${F2D:-$PWD}"
+export F2D="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export REPO_ROOT="${REPO_ROOT:-$F2D}"
-
+export F2D_ROOT="$F2D"
+export LEAD_ROOT="$F2D/../lead-cvpr2026"
+export SCENARIO_RUNNER_ROOT="$F2D/scenario_runner"
+export LEADERBOARD_ROOT="$F2D/leaderboard"
+export CARLA_ROOT="$F2D/f2d_carla"
 # ------------------------------------------------------------------------------
 # 1. Common / General Environment
 # ------------------------------------------------------------------------------
 env_common() {
-    export CARLA_ROOT="${CARLA_ROOT:-$F2D/f2d_carla}"
+    export NUMBA_CACHE_DIR="${SLURM_TMPDIR:-/tmp}/f2d-numba-${USER}-${SLURM_JOB_ID:-manual}"
+
+    mkdir -p "$NUMBA_CACHE_DIR" || return 1
+    touch "$NUMBA_CACHE_DIR/.write_test" || return 1
+    rm -f "$NUMBA_CACHE_DIR/.write_test"
+
     export LIVE_VISU="${LIVE_VISU:-0}"
     export DEBUG_CHALLENGE="${DEBUG_CHALLENGE:-1}"
     export DEBUG_LOG_EGO_STAT="${DEBUG_LOG_EGO_STAT:-true}"
@@ -37,9 +47,10 @@ env_hipad() {
     export HIPAD_STEER_LAYERS="0,1,2,3,4,5"
 
     export STEERING_ALPHA="1.0"
-    export BRAKE_ACTIVATION_ALPHA_SCALE="1.0"
+    export BRAKE_ACTIVATION_ALPHA_SCALE="1.2"
     export LEFT_ACTIVATION_ALPHA_SCALE="3.0"
-    export RIGHT_ACTIVATION_ALPHA_SCALE="2.0"
+    # export RIGHT_ACTIVATION_ALPHA_SCALE="2.0"
+    export RIGHT_ACTIVATION_ALPHA_SCALE="3.0"
 }
 
 env_tfv6() {
@@ -112,20 +123,22 @@ env_oracle() {
     export PDM_ORACLE_ROADBLOCKED_DISTANCE="40"
     export PDM_ORACLE_PRIORITY_DISTANCE="25"
     export PDM_ORACLE_YIELD_EMERGENCY_DISTANCE="50"
+    export PDM_ORACLE_BRAKE_HAZARD_DISTANCE="25"
     export PDM_ORACLE_GENERAL_BRAKE="1"
 
+    export PDM_ORACLE_BRAKE_DISTANCE_MARGIN="3.0"
     export PDM_ORACLE_PARKING_EXIT_REAR_TIME_GAP="3.0"
     export PDM_ORACLE_SAME_LANE_LATERAL_MARGIN="2.0"
 }
 
 env_new_oracle() {
-    PDM_ORACLE_CLOSED_LOOP=1
-    # optional
-    PDM_ORACLE_CL_ALPHA_MAX=3.0
-    PDM_ORACLE_CL_KP=0.8
-    PDM_ORACLE_CL_OVERSHOOT_MARGIN=1.0
-    PDM_ORACLE_CL_HEADING_SOFT_DEG=15
-    PDM_ORACLE_CL_HEADING_HARD_DEG=35
+    export PDM_ORACLE_CLOSED_LOOP="1"
+
+    export PDM_ORACLE_CL_ALPHA_MAX="3.0"
+    export PDM_ORACLE_CL_KP="0.8"
+    export PDM_ORACLE_CL_OVERSHOOT_MARGIN="1.0"
+    export PDM_ORACLE_CL_HEADING_SOFT_DEG="15"
+    export PDM_ORACLE_CL_HEADING_HARD_DEG="35"
 }
 
 env_oracle_brake_only() {
@@ -139,6 +152,7 @@ env_depth_ttc() {
     export STEERING_POLICY="depth_ttc"
     export DEPTH_TTC_STEERING="1"
     export DEPTH_TTC_VERBOSE="1"
+    export DEPTH_TTC_SERVER_VERBOSE="0"
     export DEPTH_TTC_EVERY_N="5"
 
     export DEPTH_TTC_HOLD_FRAMES="10"
@@ -159,8 +173,10 @@ env_vlm() {
     export STEERING_POLICY="vlm"
     export VLM_STEERING="1"
 
-    export ROOT="${ROOT:-$HOME}"
-    export ALPAMAYO_ROOT="${ALPAMAYO_ROOT:-$ROOT/alpamayo1.5}"
+    # export ROOT="${ROOT:-$HOME}"
+    export ROOT=/mnt/bapve/thome/wangyuhao
+    # export ALPAMAYO_ROOT="${ALPAMAYO_ROOT:-$ROOT/alpamayo1.5}"
+    export ALPAMAYO_ROOT="$ROOT/alpamayo1.5"
     export ALPAMAYO_REPO="${ALPAMAYO_REPO:-$ALPAMAYO_ROOT}"
     export ALPAMAYO_PY="${ALPAMAYO_PY:-$ALPAMAYO_ROOT/a1_5_venv/bin/python}"
     export ALPAMAYO_MODEL="${ALPAMAYO_MODEL:-nvidia/Alpamayo-1.5-10B}"
@@ -204,7 +220,7 @@ env_debug() {
     export ORACLE_VERBOSE="true"
     export VLM_VERBOSE="true"
     export DEBUG_LOG_EGO_STAT="true"
-    export DEPTH_TTC_SERVER_VERBOSE="true"
+    export DEPTH_TTC_SERVER_VERBOSE="0"
 }
 
 # ------------------------------------------------------------------------------

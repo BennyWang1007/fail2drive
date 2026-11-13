@@ -1,25 +1,38 @@
-﻿import os
+import os
 import subprocess
 import time
 import json
 import argparse
 from tqdm import tqdm
 import random
-import shutil
 import re
 import sys
+import shlex
 from collections import Counter
 
 FAIL2DRIVE_JOB_PREFIX = "Fail2Drive_"
-MAX_JOBS_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "eval_num_jobs.txt"
-)
-# [MODIFIED] Global variable to store CLI override for maximum parallel jobs
+MAX_JOBS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval_num_jobs.txt")
 CLI_MAX_PARALLEL_JOBS = None
+RESULTS_ROOT = ""
+EXCLUDED_NODES = "cp15,cp18"
+DEFAULT_ROUTES_PER_JOB = 50
+WORKER_MAX_HOURS = 48  # normal QoS limit; completed route results survive job expiry.
+
+# Applies to both HiPAD and TFv6. Later entries override earlier ones.
+GRES_MAPPING = {
+    "vlm": "gpu:2",
+    "depth_ttc": "gpu:2",
+    # "vlm": "gpu:nvidia_geforce_rtx_4090:2",
+    # "depth_ttc": "gpu:nvidia_geforce_rtx_4090:2",
+}
+ROUTE_TIME_LIMIT = "4h"
+CARLA_RPC_TIMEOUT = 12600  # Default: 3.5 hours; route wall limit remains 4 hours.
+CARLA_RPC_TIMEOUT_BY_NODE = {
+    "cp16": 1200,
+}
 
 RETRYABLE_STATUSES = {
     "Failed - Agent couldn't be set up",
-    # "Failed",
     "Failed - Simulation crashed",
     "Failed - Agent crashed",
 }
@@ -29,47 +42,25 @@ def job_name(job):
     return f"{FAIL2DRIVE_JOB_PREFIX}{job['seed']}_{job['route_id']}"
 
 
-# You will likely have to customize this function a bit to work with your cluster partition names etc.
-# NOTE: Make sure to run this python script with the correct conda env which automatically sets the env vars.
-# If you have issues with the variables, such as WORK_DIR not being set, you can export them in the following bash file.
-def bash_file(
+def batch_name(batch):
+    seed = batch[0]["seed"] // 10000
+    return f"{FAIL2DRIVE_JOB_PREFIX}{seed}_batch_{batch[0]['route_id']}_{batch[-1]['route_id']}"
+
+
+def route_script(
     job,
     cfg,
-    carla_world_port_start,
-    carla_streaming_port_start,
-    carla_tm_port_start,
     model_port_start=40000,
+    fresh_carla=False,
 ):
     route = job["route"]
     route_id = job["route_id"]
     seed = job["seed"]
     viz_path = job["viz_path"]
     result_file = job["result_file"]
-    log_file = job["log_file"]
-    err_file = job["err_file"]
-    job_file = job["job_file"]
     env_var_cmd = cfg.get("env_var_cmd", "")
     eval_mode = cfg.get("eval_mode", "none")
     is_server = eval_mode in ("depth_ttc", "vlm")
-
-    cpus = 16 if is_server else 8
-    mem = "32G" if is_server else "16gb"
-    # time_limit = "24:00:00" if is_server else "4:00:00"
-    time_limit = "4:00:00"
-    GRES_MAPPING = {
-        "vlm": "gpu:nvidia_geforce_rtx_4090:2",
-        # "vlm": "gpu:2",
-        # "depth_ttc": "gpu:2"
-        "depth_ttc": "gpu:nvidia_geforce_rtx_4090:2"
-    }
-    # gres = "gpu:nvidia_geforce_rtx_4090:2" if is_server else "gpu:1"
-    gres = GRES_MAPPING.get(eval_mode, "gpu:1")
-
-    render_args = (
-        '-RenderOffScreen -graphicsadapter="${CARLA_GRAPHICS_ADAPTER:-0}"'
-        if cfg["rgb"]
-        else "-nullrhi"
-    )
 
     server_setup = ""
     carla_gpu_prefix = ""
@@ -79,7 +70,7 @@ def bash_file(
             server_cmd = """export DEPTH_TTC_SERVER_URL="http://127.0.0.1:$FREE_MODEL_PORT/score"
 export DEPTH_TTC_DEBUG_DIR="${DEPTH_TTC_DEBUG_DIR:-$VIZ_PATH/depth_ttc_debug}"
 SERVER_LOG="$VIZ_PATH/depth_ttc_server_${SLURM_JOB_ID:-manual}.log"
-CUDA_VISIBLE_DEVICES="$SERVER_GPU" python -u "$F2D/tools/depth_ttc_server.py" \
+CUDA_VISIBLE_DEVICES="$SERVER_GPU" setsid python -u "$F2D/tools/depth_ttc_server.py" \
     --host 127.0.0.1 \
     --port "$FREE_MODEL_PORT" \
     --device cuda:0 \
@@ -93,7 +84,7 @@ export ALPAMAYO_SERVER_URL="$VLM_SERVER_URL"
 export ALPAMAYO_RAW_LOG_PATH="${ALPAMAYO_RAW_LOG_PATH:-$VIZ_PATH/alpamayo_raw_responses.txt}"
 export ALPAMAYO_INPUT_SAVE_DIR="${ALPAMAYO_INPUT_SAVE_DIR:-$VIZ_PATH/alpamayo_inputs}"
 SERVER_LOG="$VIZ_PATH/alpamayo_server_${SLURM_JOB_ID:-manual}.log"
-CUDA_VISIBLE_DEVICES="$SERVER_GPU" "$ALPAMAYO_PY" -u "$F2D/tools/alpamayo_vlm_server.py" \
+CUDA_VISIBLE_DEVICES="$SERVER_GPU" setsid "$ALPAMAYO_PY" -u "$F2D/tools/alpamayo_vlm_server.py" \
     --host 127.0.0.1 \
     --port "$FREE_MODEL_PORT" \
     --device cuda:0 \
@@ -107,6 +98,10 @@ SERVER_PID=$!"""
 
         server_setup = f"""
 IFS=',' read -r EVAL_GPU SERVER_GPU _ <<< "${{CUDA_VISIBLE_DEVICES:-0,1}}"
+if [ -z "$EVAL_GPU" ] || [ -z "$SERVER_GPU" ] || [ "$EVAL_GPU" = "$SERVER_GPU" ]; then
+    echo "VLM/Depth-TTC requires two distinct allocated GPUs." >&2
+    exit 1
+fi
 echo "EVAL_GPU=$EVAL_GPU SERVER_GPU=$SERVER_GPU"
 
 FREE_MODEL_PORT=`comm -23 \
@@ -119,40 +114,10 @@ mkdir -p "$VIZ_PATH"
 {server_cmd}
 echo "Started {eval_mode} server pid=$SERVER_PID log=$SERVER_LOG"
 
-for _ in $(seq 1 180); do
-    if curl -sf "http://127.0.0.1:$FREE_MODEL_PORT/health" >/dev/null; then
-        echo "Server is ready."
-        break
-    fi
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-        echo "Server exited during startup:" >&2
-        tail -100 "$SERVER_LOG" >&2 || true
-        exit 1
-    fi
-    sleep 5
-done
+sleep 60  # Fixed model startup delay; no readiness polling.
 """
 
-    with open(job_file, "w", encoding="utf-8") as rsh:
-        rsh.write(f"""#!/bin/bash
-#SBATCH --job-name={job_name(job)}
-#SBATCH --partition=devq
-#SBATCH --qos=normal
-#SBATCH -o {log_file}
-#SBATCH -e {err_file}
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task={cpus}
-#SBATCH --mem={mem}
-#SBATCH --time={time_limit}
-#SBATCH --gres={gres}
-#### SBATCH -w cp[14-15,17,20]
-#### SBATCH -C "[nvidia_geforce_rtx_3090|nvidia_geforce_rtx_3090_ti|nvidia_geforce_rtx_4080_super|nvidia_geforce_rtx_4090]"
-# NOTE: Partition and gres likely need to be updated for your cluster
-
-# NOTE: Make sure that the time limit is enough for your model to fail the route!
-# Example: Timeout may take 3-4 minutes in game time, if cluster time limit enables only 2:30 game time, the route will be resubmitted until it succeeds!
-
+    return f"""#!/bin/bash
 echo 'HPC Node Name:' $(hostname)
 echo JOB ID $SLURM_JOB_ID
 
@@ -163,54 +128,83 @@ export VISUAL_OUTPUT_PATH={viz_path}
 export BENCHMARK_ROUTE_ID="{route_id}"
 
 {env_var_cmd}
+if [ -n "$VIZ_PATH" ]; then mkdir -p "$VIZ_PATH" || exit 1; fi
 printenv | sort
 nvidia-smi -L
 nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used --format=csv
 
 SERVER_PID=""
-CARLA_PID=""
 cleanup() {{
-    [ -n "$CARLA_PID" ] && kill "$CARLA_PID" 2>/dev/null || true
-    [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
+    if [ -n "$SERVER_PID" ]; then
+        kill -TERM -- -"$SERVER_PID" 2>/dev/null || true
+        sleep 2
+        kill -KILL -- -"$SERVER_PID" 2>/dev/null || true
+    fi
 }}
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 {server_setup}
-FREE_WORLD_PORT=`comm -23 \
-    <(seq {carla_world_port_start} {carla_world_port_start + 49} | sort) \
-    <(ss -Htan | awk \'{{print $4}}\' | cut -d\':\' -f2 | sort -u) \
-    | shuf | head -n 1`
-echo 'World Port:' $FREE_WORLD_PORT
 
-FREE_STREAMING_PORT=`comm -23 \
-    <(seq {carla_streaming_port_start} {carla_streaming_port_start + 49} | sort) \
-    <(ss -Htan | awk \'{{print $4}}\' | cut -d\':\' -f2 | sort -u) \
-    | shuf | head -n 1`
-echo 'Streaming Port:' $FREE_STREAMING_PORT
+# Start a fresh episode on the existing CARLA process, even for the same map.
+# This also removes actors/sensors left by a failed or timed-out prior route.
+{carla_gpu_prefix}python -X faulthandler -u - {shlex.quote(route)} "$FREE_WORLD_PORT" "$TM_PORT" "$CARLA_RPC_TIMEOUT" <<'F2D_RESET_WORLD'
+import faulthandler
+import os
+import sys
+import time
+import xml.etree.ElementTree as ET
 
-export TM_PORT=`comm -23 \
-    <(seq {carla_tm_port_start} {carla_tm_port_start + 49} | sort) \
-    <(ss -Htan | awk \'{{print $4}}\' | cut -d\':\' -f2 | sort -u) \
-    | shuf | head -n 1`
-echo 'TM Port:' $TM_PORT
+def mark(message):
+    print("[CARLA RESET]", time.strftime("%Y-%m-%d %H:%M:%S"), message, flush=True)
 
-# NOTE: Changing -graphicsadapter=0 can be useful on multi-gpu systems
+faulthandler.enable(all_threads=True)
+faulthandler.dump_traceback_later(120, repeat=True)
+mark("import carla: begin")
+import carla
+mark("import carla: done; module=" + str(carla.__file__))
+mark("python=" + sys.executable + " pid=" + str(os.getpid()))
+mark("route=" + sys.argv[1] + " rpc=" + sys.argv[2] + " tm=" + sys.argv[3])
 
-CARLA_LOG_DIR="${{TEST_OUTPUT:-{viz_path}}}/carla_log"
-mkdir -p "$CARLA_LOG_DIR"
-CARLA_LOG="$CARLA_LOG_DIR/carla_log_${{SLURM_JOB_ID:-manual}}.log"
-
-{carla_gpu_prefix}"$CARLA_ROOT/CarlaUE4.sh" \
-    -carla-rpc-port="$FREE_WORLD_PORT" \
-    -nosound \
-    {render_args} \
-    -carla-primary-port=0 \
-    -carla-streaming-port="$FREE_STREAMING_PORT" \
-    >"$CARLA_LOG" 2>&1 &
-
-CARLA_PID=$!
-echo "Started CARLA pid=$CARLA_PID log=$CARLA_LOG"
-
-sleep 60  # Wait for CARLA to finish starting
+route = ET.parse(sys.argv[1]).getroot().find("route")
+if route is None or not route.get("town"):
+    raise ValueError("Route XML has no town")
+mark("Client(): begin")
+client = carla.Client("127.0.0.1", int(sys.argv[2]))
+mark("Client(): done; set_timeout(): begin")
+client.set_timeout(int(sys.argv[4]))
+mark("set_timeout(): done; client_version=" + client.get_client_version())
+# Do not create a Traffic Manager in this short-lived reset process. The
+# evaluator owns its TM and creates it after this process has loaded the map.
+# TM asynchronous mode alone does not release a synchronous world waiting
+# for ticks; explicitly restore world settings before requesting a reload.
+if {fresh_carla!r}:
+    mark("fresh CARLA: load requested map without waiting for the default world")
+else:
+    mark("get_world(): begin")
+    previous_world = client.get_world()
+    mark("get_world(): done; get_settings(): begin")
+    settings = previous_world.get_settings()
+    mark("get_settings(): done; synchronous_mode=" + str(settings.synchronous_mode))
+    if settings.synchronous_mode:
+        settings.synchronous_mode = False
+        settings.fixed_delta_seconds = None
+        mark("apply_settings(async): begin")
+        previous_world.apply_settings(settings)
+        mark("apply_settings(async): done")
+    del previous_world
+mark("load_world(" + route.get("town") + "): begin")
+world = client.load_world(route.get("town"), reset_settings=True)
+mark("load_world(): done; get_map(): begin")
+print("[CARLA] Fresh world loaded:", world.get_map().name, flush=True)
+mark("get_map(): done; reset complete; leaving interpreter")
+faulthandler.cancel_dump_traceback_later()
+F2D_RESET_WORLD
+reset_exit=$?
+if [ "$reset_exit" -ne 0 ]; then
+    echo "[CARLA RESET] process failed exit=$reset_exit" >&2
+    exit "$reset_exit"
+fi
 
 # NOTE: --track=MAP may have to be changed according to agent track
 {carla_gpu_prefix}python -u {cfg["lb_script"]} \
@@ -218,13 +212,155 @@ sleep 60  # Wait for CARLA to finish starting
 --repetitions=1 \
 --track=SENSORS \
 --checkpoint={result_file} \
---timeout=300 \
+--timeout="$CARLA_RPC_TIMEOUT" \
 --agent={cfg["agent_file"]} \
 --agent-config={cfg["agent_config"]} \
 --port=${{FREE_WORLD_PORT}} \
 --traffic-manager-port=${{TM_PORT}} \
 --traffic-manager-seed={seed}
-""")
+"""
+
+
+def carla_setup(cfg, log_dir, world_port, streaming_port, tm_port):
+    """Launch one CARLA process for the entire sequential batch."""
+    render_args = (
+        '-RenderOffScreen -graphicsadapter="${CARLA_GRAPHICS_ADAPTER:-0}"'
+        if cfg["rgb"] else "-nullrhi"
+    )
+    gpu_setup = ""
+    gpu_prefix = ""
+    timeout_cases = "\n".join(
+        f"    {node}) export CARLA_RPC_TIMEOUT={seconds} ;;"
+        for node, seconds in CARLA_RPC_TIMEOUT_BY_NODE.items()
+    )
+    if cfg["eval_mode"] in ("vlm", "depth_ttc"):
+        gpu_setup = '''IFS=',' read -r EVAL_GPU SERVER_GPU _ <<< "${CUDA_VISIBLE_DEVICES:-0,1}"
+if [ -z "$EVAL_GPU" ] || [ -z "$SERVER_GPU" ] || [ "$EVAL_GPU" = "$SERVER_GPU" ]; then
+    echo "VLM/Depth-TTC requires two distinct allocated GPUs." >&2
+    exit 1
+fi
+export EVAL_GPU SERVER_GPU'''
+        gpu_prefix = 'CUDA_VISIBLE_DEVICES="$EVAL_GPU" '
+    return f"""
+{cfg.get('env_var_cmd', '') or ':'}
+env_exit=$?
+if [ "$env_exit" -ne 0 ]; then exit "$env_exit"; fi
+{gpu_setup}
+node_name="${{SLURMD_NODENAME:-$(hostname -s)}}"
+node_name="${{node_name%%.*}}"
+export CARLA_RPC_TIMEOUT={CARLA_RPC_TIMEOUT}
+case "$node_name" in
+{timeout_cases}
+esac
+echo "[CARLA] node=$node_name RPC timeout=$CARLA_RPC_TIMEOUT seconds"
+CARLA_PID=""
+ROUTE_PID=""
+cleanup_batch() {{
+    if [ -n "$ROUTE_PID" ]; then
+        kill -TERM "$ROUTE_PID" 2>/dev/null || true
+    fi
+    if [ -n "$CARLA_PID" ]; then
+        kill -TERM -- -"$CARLA_PID" 2>/dev/null || true
+        sleep 2
+        kill -KILL -- -"$CARLA_PID" 2>/dev/null || true
+    fi
+}}
+trap cleanup_batch EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+export FREE_WORLD_PORT=$(comm -23 \\
+    <(seq {world_port} {world_port + 49} | sort) \\
+    <(ss -Htan | awk '{{print $4}}' | cut -d':' -f2 | sort -u) | shuf | head -n 1)
+FREE_STREAMING_PORT=$(comm -23 \\
+    <(seq {streaming_port} {streaming_port + 49} | sort) \\
+    <(ss -Htan | awk '{{print $4}}' | cut -d':' -f2 | sort -u) | shuf | head -n 1)
+export TM_PORT=$(comm -23 \\
+    <(seq {tm_port} {tm_port + 49} | sort) \\
+    <(ss -Htan | awk '{{print $4}}' | cut -d':' -f2 | sort -u) | shuf | head -n 1)
+
+mkdir -p {shlex.quote(log_dir)} || exit 1
+CARLA_LOG={shlex.quote(log_dir)}/carla_${{SLURM_JOB_ID:-manual}}.log
+{gpu_prefix}setsid "$CARLA_ROOT/CarlaUE4.sh" \\
+    -carla-rpc-port="$FREE_WORLD_PORT" \\
+    -nosound {render_args} \\
+    -carla-primary-port=0 \\
+    -carla-streaming-port="$FREE_STREAMING_PORT" \\
+    >"$CARLA_LOG" 2>&1 &
+CARLA_PID=$!
+echo "[CARLA] Batch process pid=$CARLA_PID port=$FREE_WORLD_PORT log=$CARLA_LOG"
+sleep 60
+"""
+
+
+def bash_file(batch, cfg, world_port, streaming_port, tm_port, model_port):
+    """One allocation, sequential routes, each limited to four hours in total."""
+    first = batch[0]
+    base_dir = os.path.dirname(os.path.dirname(first["job_file"]))
+    name = batch_name(batch)
+    # Keep filenames short even when a batch contains 50 routes. The full route
+    # list is stored in the script comment below for queue-to-route mapping.
+    tag = f"{first['route_id']}_{batch[-1]['route_id']}"
+    route_ids = ",".join(job["route_id"] for job in batch)
+    job_file = os.path.join(base_dir, "run", f"eval_batch_{tag}.sh")
+    log_file = os.path.join(base_dir, "out", f"batch_{tag}_out.log")
+    err_file = os.path.join(base_dir, "err", f"batch_{tag}_err.log")
+    hours = min(4 * len(batch), WORKER_MAX_HOURS)
+    days, hours = divmod(hours, 24)
+    time_limit = f"{days}-{hours:02d}:00:00"
+    is_server = cfg["eval_mode"] in ("vlm", "depth_ttc")
+    cpus = 16 if is_server else 8
+    mem = "32G" if is_server else "16G"
+    # Optional placement for notes/reserved_experiments.sh; normal submissions
+    # retain their existing resource requests and node selection.
+    mem = os.environ.get("F2D_WORKER_MEM", mem)
+    excluded_nodes = os.environ.get("F2D_WORKER_EXCLUDE", EXCLUDED_NODES)
+    placement = ""
+    if os.environ.get("F2D_WORKER_NODE"):
+        placement += f"#SBATCH --nodelist={os.environ['F2D_WORKER_NODE']}\n"
+    if os.environ.get("F2D_RESERVATION"):
+        placement += f"#SBATCH --reservation={os.environ['F2D_RESERVATION']}\n"
+    gres = GRES_MAPPING.get(cfg["eval_mode"], "gpu:1")
+    script = f"""#!/bin/bash
+#SBATCH --job-name={name}
+#SBATCH --partition=devq
+#SBATCH --qos=normal
+#SBATCH --exclude={excluded_nodes}
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task={cpus}
+#SBATCH --mem={mem}
+#SBATCH --time={time_limit}
+#SBATCH --gres={gres}
+#SBATCH --output={log_file}
+#SBATCH --error={err_file}
+{placement}# F2D_ROUTE_IDS={route_ids}
+
+echo "HPC Node Name: $(hostname)"
+echo "SLURM JOB ID: $SLURM_JOB_ID | Batch: {name} ({len(batch)} routes)"
+batch_exit=0
+"""
+    script += carla_setup(cfg, os.path.join(base_dir, "out", "carla_log"),
+                          world_port, streaming_port, tm_port)
+    for index, job in enumerate(batch, 1):
+        body = route_script(job, cfg, model_port, fresh_carla=index == 1)
+        delimiter = f"F2D_ROUTE_{index}_SCRIPT"
+        script += f"""
+echo "[Batch] Starting route {index}/{len(batch)}: {job['route_id']}"
+timeout --signal=TERM --kill-after=30s {ROUTE_TIME_LIMIT} bash >{shlex.quote(job['log_file'])} 2>{shlex.quote(job['err_file'])} <<'{delimiter}' &
+{body}
+{delimiter}
+ROUTE_PID=$!
+wait "$ROUTE_PID"
+route_exit=$?
+ROUTE_PID=""
+echo "[Batch] Route {job['route_id']} exit=$route_exit"
+if [ "$route_exit" -ne 0 ]; then batch_exit=1; fi
+"""
+    script += '\nexit "$batch_exit"\n'
+    with open(job_file, "w", encoding="utf-8") as handle:
+        handle.write(script)
+    return job_file
 
 
 def get_running_jobs():
@@ -248,6 +384,37 @@ def get_running_jobs():
         job_id, _, name = line.partition("|")
         if exact_job_pattern.match(name.strip()):
             running[name.strip()] = job_id.strip()
+    batch_pattern = re.compile(rf"^{re.escape(FAIL2DRIVE_JOB_PREFIX)}(\d+)_b([0-9-]+)$")
+    compact_pattern = re.compile(
+        rf"^{re.escape(FAIL2DRIVE_JOB_PREFIX)}(\d+)_batch_(\d+)_(\d+)$"
+    )
+    for line in out.splitlines():
+        job_id, _, name = line.partition("|")
+        compact = compact_pattern.fullmatch(name.strip())
+        if compact:
+            seed = int(compact.group(1))
+            script = os.path.join(
+                RESULTS_ROOT, str(seed), "run",
+                f"eval_batch_{compact.group(2)}_{compact.group(3)}.sh",
+            )
+            route_ids = None
+            with open(script, encoding="utf-8") as handle:
+                for script_line in handle:
+                    if script_line.startswith("# F2D_ROUTE_IDS="):
+                        route_ids = script_line.strip().partition("=")[2].split(",")
+                        break
+            if not route_ids or any(not rid.isdigit() for rid in route_ids):
+                raise RuntimeError(f"Cannot identify routes of running batch {job_id}: {script}")
+            for route_id in route_ids:
+                route_seed = seed * 10000 + int(route_id) % 1000
+                running[f"{FAIL2DRIVE_JOB_PREFIX}{route_seed}_{route_id}"] = job_id.strip()
+            continue
+        match = batch_pattern.fullmatch(name.strip())
+        if match:
+            seed = int(match.group(1))
+            for route_id in match.group(2).split("-"):
+                route_seed = seed * 10000 + int(route_id) % 1000
+                running[f"{FAIL2DRIVE_JOB_PREFIX}{route_seed}_{route_id}"] = job_id.strip()
     return running
 
 
@@ -412,33 +579,6 @@ def dry_run_report(job_queue, verbose=False):
     print()
 
 
-def kill_dead_jobs(jobs, running_jobs):
-    for job in jobs:
-        job_id = running_jobs.get(job_name(job))
-        if job_id is None:
-            continue
-
-        log = job["log_file"]
-        if not os.path.exists(log):
-            continue
-
-        with open(log) as f:
-            lines = f.readlines()
-        if len(lines) == 0:
-            continue
-
-        if (
-            any(["Watchdog exception" in line for line in lines])
-            or "Engine crash handling finished; re-raising signal 11 for the default handler. Good bye.\n"
-            in lines
-            or " [91mStopping the route, the agent has crashed:\n" in lines
-            or " [91mError during the simulation:\n" in lines
-            or any(["The simulation took longer than" in line for line in lines])
-        ):
-
-            subprocess.Popen(f"scancel {job_id}", shell=True)
-
-
 if __name__ == "__main__":
 
     default_mode = os.environ.get("ACTIVATION_POLICY", "none")
@@ -484,13 +624,18 @@ if __name__ == "__main__":
                         type=int, default=None,
                         help="Maximum number of concurrent Slurm jobs for this evaluator (overrides eval_num_jobs.txt)")
 
+    parser.add_argument("--routes-per-job", "--routes_per_job", type=int, default=DEFAULT_ROUTES_PER_JOB,
+                        help="Routes run sequentially per Slurm job (each at most 4h)")
     args = parser.parse_args()
+    if args.routes_per_job < 1:
+        parser.error("--routes-per-job must be >= 1")
     if not args.dry_run and (args.agent_file is None or args.agent_config is None):
         parser.error("--agent_file and --agent_config are required unless --dry-run is set")
 
     routes = sorted([x for x in os.listdir(args.routes) if x[-4:] == ".xml"])
 
     out_root = args.out_root
+    RESULTS_ROOT = out_root
     if not args.dry_run:
         os.makedirs(out_root, exist_ok=True)
 
@@ -546,6 +691,11 @@ if __name__ == "__main__":
             viz_path = ""
             if cfg["viz"]:
                 viz_path = os.path.join(base_dir, "viz", route_id)
+                if os.environ.get("F2D_IN_ALLOCATION") == "1":
+                    # Keep prior users' visualizations intact; new allocations
+                    # write into a fresh directory with the current user's owner.
+                    viz_path = os.path.join(base_dir, "viz",
+                                            f"allocation_{os.environ['SLURM_JOB_ID']}", route_id)
 
             result_file = os.path.join(base_dir, "res", f"{route_id}_res.json")
             log_file = os.path.join(base_dir, "out", f"{route_id}_out.log")
@@ -600,7 +750,7 @@ if __name__ == "__main__":
             print(f"[warn] Giving up after {round_idx} rounds, still unfinished:")
             for job in job_queue:
                 print(f"  {job_name(job)} route={job['route_id']}")
-            break
+            sys.exit(1)
         round_idx += 1
         print(f"[round {round_idx}/{args.max_rounds}] {len(job_queue)} unfinished jobs")
 
@@ -608,66 +758,55 @@ if __name__ == "__main__":
         progress = tqdm(total=jobs)
         while job_queue:
             running_jobs = get_running_jobs()  # the ONLY squeue call per iteration
-            kill_dead_jobs(job_queue, running_jobs)
             job_queue = filter_completed(job_queue, running_jobs)
 
             progress.update(jobs - len(job_queue) - progress.n)
 
             max_num_parallel_jobs = get_max_num_parallel_jobs()
 
-            # Fill all free slots in one pass (the old code submitted one job per squeue)
-            for job in job_queue:
-                if len(running_jobs) >= max_num_parallel_jobs:
-                    break
-
-                # Out of tries, or already in squeue (even if started by an earlier launch)
-                if job["tries"] <= 0 or job_name(job) in running_jobs:
-                    continue
-
-                # Need to submit this job
-                carla_world_port_start = carla_world_ports[port_idx]
-                carla_streaming_port_start = carla_streaming_ports[port_idx]
-                carla_tm_port_start = carla_tm_ports[port_idx]
-                model_port_start = model_server_ports[port_idx]
-                port_idx += 1
-                port_idx %= 200
-
-                # Make bash file:
-                bash_file(
-                    job,
-                    cfg,
-                    carla_world_port_start,
-                    carla_streaming_port_start,
-                    carla_tm_port_start,
-                    model_port_start,
-                )
-
-                # submit
-                if cfg["viz"]:
-                    if os.path.exists(job["viz_path"]):
-                        shutil.rmtree(job["viz_path"])
-                    os.makedirs(job["viz_path"], exist_ok=True)
-
-                for file in [job["result_file"], job["err_file"], job["log_file"]]:
-                    if os.path.exists(file):
-                        os.remove(file)
-                try:
-                    job_id = (
-                        subprocess.check_output(f'sbatch {job["job_file"]}', shell=True)
-                        .decode("utf-8")
-                        .strip()
-                        .rsplit(" ", maxsplit=1)[-1]
+            ready = [job for job in job_queue
+                     if job["tries"] > 0 and job_name(job) not in running_jobs]
+            for seed in seeds:
+                seed_jobs = [job for job in ready if job["seed"] // 10000 == seed]
+                for offset in range(0, len(seed_jobs), args.routes_per_job):
+                    if len(set(running_jobs.values())) >= max_num_parallel_jobs:
+                        break
+                    batch = seed_jobs[offset:offset + args.routes_per_job]
+                    print(f"[submit] Preparing script: seed={seed}, routes={len(batch)}", flush=True)
+                    job_file = bash_file(
+                        batch, cfg,
+                        carla_world_ports[port_idx % len(carla_world_ports)],
+                        carla_streaming_ports[port_idx % len(carla_streaming_ports)],
+                        carla_tm_ports[port_idx % len(carla_tm_ports)],
+                        model_server_ports[port_idx % len(model_server_ports)],
                     )
-                except (subprocess.SubprocessError, OSError) as exc:
-                    print(
-                        f"[warn] Failed to submit job '{job['job_file']}': {exc}")
-                    continue
-
-                running_jobs[job_name(job)] = job_id
-                job["tries"] -= 1
-
-                print(f'submit {job["job_file"]} {job_id}')
-                print(f'Job queue size: {len(job_queue)}')
+                    port_idx += 1
+                    print(f"[submit] Script ready: {job_file}", flush=True)
+                    try:
+                        if os.environ.get("F2D_IN_ALLOCATION") == "1":
+                            # Reuse the enclosing Slurm step. Running synchronously
+                            # preserves result checks/retries without nested sbatch.
+                            if not os.environ.get("SLURM_JOB_ID"):
+                                raise RuntimeError("F2D_IN_ALLOCATION requires a Slurm allocation")
+                            base_dir = os.path.dirname(os.path.dirname(job_file))
+                            tag = f"batch_{batch[0]['route_id']}_{batch[-1]['route_id']}"
+                            with open(os.path.join(base_dir, "out", tag + "_out.log"), "w") as batch_out, \
+                                 open(os.path.join(base_dir, "err", tag + "_err.log"), "w") as batch_err:
+                                result = subprocess.run(["bash", job_file], stdout=batch_out, stderr=batch_err)
+                            job_id = os.environ["SLURM_JOB_ID"]
+                            print(f"allocation batch finished: job={job_id} exit={result.returncode}", flush=True)
+                        else:
+                            print(f"[submit] Calling sbatch: {job_file}", flush=True)
+                            job_id = subprocess.check_output(
+                                ["sbatch", "--parsable", job_file], text=True
+                            ).strip().split(";", 1)[0]
+                    except (subprocess.SubprocessError, OSError) as exc:
+                        print(f"[warn] Failed to submit {job_file}: {exc}")
+                        break
+                    for job in batch:
+                        running_jobs[job_name(job)] = job_id
+                        job["tries"] -= 1
+                    print(f"submit {job_file} (JobID={job_id}, routes={[job['route_id'] for job in batch]})", flush=True)
 
             time.sleep(15)
         progress.close()

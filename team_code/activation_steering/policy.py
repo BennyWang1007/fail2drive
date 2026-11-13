@@ -7,7 +7,7 @@ from typing import Any, Callable, Optional, Tuple, Union, List
 
 import numpy as np
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
-from depth_ttc_gate import DepthTTCClient, DepthTTCDecision
+from depth_ttc_gate import AsyncDepthTTCClient, DepthTTCDecision
 
 Trigger = Tuple[str, str, Optional[int], float]
 Latch = Tuple[str, int]
@@ -254,11 +254,11 @@ class FixedAfterFramePolicy(ActivationPolicy):
 
 
 class DepthTTCPolicy(ActivationPolicy):
-    """Select an activation-steered planner candidate using Depth-TTC."""
+    """Score in the background and apply completed actions to current predictions."""
 
     ACTIONS = ("original", "brake", "left", "right")
 
-    def __init__(self, client: DepthTTCClient, training_config):
+    def __init__(self, client: AsyncDepthTTCClient, training_config):
         self.client = client
         self.training_config = training_config
         self.every_n = max(1, int(os.environ.get("DEPTH_TTC_EVERY_N", 1)))
@@ -269,6 +269,10 @@ class DepthTTCPolicy(ActivationPolicy):
         self.last_score_frame: int | None = None
         self.active_until = -1
         self.active_candidate = "original"
+        self._last_decision_key = None
+        self._decision_start_frame = None
+        self._candidates_frame = None
+        self._frame_candidates = None
 
         self._cached_alphas = [
             ("original", [0.0, 0.0, 0.0]),
@@ -303,8 +307,8 @@ class DepthTTCPolicy(ActivationPolicy):
 
     def decide(self, frame: int, speed: float, predict: PredictFn,
                get_image: ImageFn | None = None, input_data: dict | None = None) -> PolicyDecision:
-        should_score = self.should_score(frame, speed)
         candidates = self.candidates(frame, speed)
+        should_score = len(candidates) > 1
         print(
             f"[DepthTTC] frame={frame} speed={speed:.3f} score={'yes' if should_score else 'no'} "
             f"last_score_frame={self.last_score_frame} active_candidate={self.active_candidate} "
@@ -314,7 +318,9 @@ class DepthTTCPolicy(ActivationPolicy):
         results = {name: predict(alpha) for name, alpha in candidates}
         alphas = dict(candidates)
 
-        selected, info = next(iter(results)), None
+        selected, info = self.active_candidate, None
+        if frame > self.active_until or selected not in results:
+            selected = "original" if "original" in results else next(iter(results))
         if should_score and len(results) > 1 and get_image is not None:
             try:
                 selected, info = self.select(frame, speed, results, get_image(), input_data)
@@ -328,6 +334,8 @@ class DepthTTCPolicy(ActivationPolicy):
         return PolicyDecision(selected, alphas[selected], results[selected], info)
 
     def should_score(self, frame: int, speed: float) -> bool:
+        if self.client.busy:
+            return False
         if float(speed) < float(os.environ.get("DEPTH_TTC_MIN_SPEED_M_S", 0.0)):
             return False
         return (
@@ -336,13 +344,35 @@ class DepthTTCPolicy(ActivationPolicy):
         )
 
     def candidates(self, frame: int, speed: float) -> list[tuple[str, list[float]]]:
+        # HiPAD asks once before taking its model-state snapshot and again in
+        # decide(). Keep that choice stable even if HTTP completes in between.
+        if self._candidates_frame == frame:
+            return self._frame_candidates
+        self._candidates_frame = frame
+        self._consume_latest(frame)
         if self.should_score(frame, speed):
-            return self._candidate_alphas()
-        candidate = self.active_candidate
-        if frame > self.active_until or candidate not in {"brake", "left", "right"}:
-            candidate = "original"
-        alpha = dict(self._candidate_alphas()).get(candidate, [0.0, 0.0, 0.0])
-        return [(candidate, alpha)]
+            self._frame_candidates = self._candidate_alphas()
+        else:
+            candidate = self.active_candidate
+            if frame > self.active_until or candidate not in {"brake", "left", "right"}:
+                candidate = "original"
+            alpha = dict(self._candidate_alphas()).get(candidate, [0.0, 0.0, 0.0])
+            self._frame_candidates = [(candidate, alpha)]
+        return self._frame_candidates
+
+    def _consume_latest(self, frame):
+        decision = self.client.latest()
+        if decision is None:
+            return
+        key = (decision.frame_id, decision.timestamp)
+        if key != self._last_decision_key:
+            self._last_decision_key = key
+            self._decision_start_frame = frame
+            self._activate(frame, decision.selected_trajectory)
+        if self.client.verbose and frame <= self.active_until:
+            print(f"[DepthTTC] use step={frame} decision_frame={decision.frame_id} "
+                  f"age={frame - self._decision_start_frame} "
+                  f"selected={self.active_candidate} error={decision.error}", flush=True)
 
     @staticmethod
     def _planner_candidates(candidate_results) -> dict:
@@ -374,17 +404,18 @@ class DepthTTCPolicy(ActivationPolicy):
         self.active_until = frame + getattr(self, f"hold_frames_{candidate}", self.hold_frames) - 1
 
     def select(self, frame: int, speed: float, candidate_results, image: np.ndarray, input_data: dict | None = None) -> tuple[str, DepthTTCDecision | None]:
-        """Score candidates and return ``(selected_name, decision)``."""
-        selected = next(iter(candidate_results))
-        should_score = self.should_score(frame, speed)
+        """Submit scoring; keep using the latest held action on current predictions."""
+        selected = self.active_candidate if frame <= self.active_until else "original"
+        if selected not in candidate_results:
+            selected = next(iter(candidate_results))
+        should_score = len(candidate_results) > 1
         planner_candidates = self._planner_candidates(candidate_results)
         if should_score and len(candidate_results) > 1 and planner_candidates:
-            self.last_score_frame = frame
             calibration = self.training_config.camera_calibration[1]
             image_height, image_width = image.shape[:2]
             fov = float(calibration["fov"])
             focal_length = image_width / (2.0 * math.tan(math.radians(fov) / 2.0))
-            decision = self.client.score(
+            submitted = self.client.submit(
                 frame_id=frame,
                 rgb_image=image,
                 speed=speed,
@@ -411,23 +442,9 @@ class DepthTTCPolicy(ActivationPolicy):
                 # radar=input_data.get("radar", None) if input_data is not None else None
                 radar=None
             )
-            selected = getattr(decision, "selected_trajectory", "original")
-            if selected not in candidate_results:
-                print(
-                    f"[DepthTTCPolicy] frame={frame} invalid selection {selected!r}; "
-                    "falling back to original",
-                    flush=True,
-                )
-                selected = "original"
-            self._activate(frame, selected)
-            print(
-                f"[DepthTTCPolicy] frame={frame} decision={decision} "
-                f"selected={selected} active_until={self.active_until}",
-                flush=True,
-            )
-            if selected == "break":
-                self.last_score_frame = None  # allow brake to be re-evaluated every frame
-            return selected, decision
+            if submitted:
+                self.last_score_frame = frame
+            return selected, self.client.latest()
 
         if should_score and len(candidate_results) > 1:
             print(
@@ -457,7 +474,7 @@ class VLMPolicy(ActivationPolicy):
         # not fail, but do not map VLM scores into fractional alphas anymore.
         self.ttl_frames = int(
             decay_frames if ttl_frames is None else ttl_frames)
-        self.brake_alpha = float(os.environ.get("VLM_BRAKE_ALPHA", 2.0))
+        self.brake_alpha = float(os.environ.get("VLM_BRAKE_ALPHA", 1.0))
         self.weak_brake_alpha = float(
             os.environ.get("VLM_WEAK_BRAKE_ALPHA", 0.5))
         self.lateral_alpha = float(os.environ.get("VLM_LATERAL_ALPHA", 1.0))
@@ -650,6 +667,14 @@ class _BaseOraclePolicy(ActivationPolicy):
         # self._debug_both_lane_clear(ego, data_provider)  # For debugging, check both lane clearance and print debug info
         # self._debug_current_lane_clear_distance(ego, data_provider)  # For debugging, check current lane clearance distance and print debug info
 
+        # Expired maneuvers must not look active to trigger/brake geometry checks.
+        # Keep their cooldown so a persistent trigger cannot immediately restart.
+        for action in ("left", "right"):
+            action_index = self.ACTION_INDEX[action]
+            if frame > self._active_until[action_index]:
+                self._active_until[action_index] = -1
+                self._steer.pop(action, None)
+
         triggers = self._oracle_triggers()
         selected = self._select_triggers(triggers) if triggers else []
         self._note(f"triggers={self._fmt_triggers(triggers)} selected={self._fmt_triggers(selected)}")
@@ -718,20 +743,25 @@ class _BaseOraclePolicy(ActivationPolicy):
 
             action_index = self.ACTION_INDEX[action]
 
-            if not self._lane_clear_new(ego, action, data_provider):
-                self._note(f"{action} <- {scenario_type} rejected: target lane not clear ({self._lane_block})")
+            # An existing hold is continued below, not restarted by a live trigger
+            # (even with zero cooldown). Only check a new maneuver's lane once it
+            # is eligible to start.
+            if frame <= self._active_until[action_index]:
                 continue
-
-            exceeded, angle = self._heading_exceeded(action, ego, data_provider)
-            if exceeded:
-                self._note(f"{action} <- {scenario_type} rejected: ego heading {angle:+.1f}deg off lane "
-                           f"(right+) already points to the {action} side > {self.steer_guard.max_heading_deg:.0f}deg")
-                continue
-
             if frame < self._cooldown_until[action_index]:
                 self._note(f"{action} <- {scenario_type} rejected: cooldown until frame "
                            f"{self._cooldown_until[action_index]}")
                 continue
+
+            if not self._lane_clear_new(ego, action, data_provider):
+                self._note(f"{action} <- {scenario_type} rejected: target lane not clear ({self._lane_block})")
+                continue
+
+            # exceeded, angle = self._heading_exceeded(action, ego, data_provider)
+            # if exceeded:
+            #     self._note(f"{action} <- {scenario_type} rejected: ego heading {angle:+.1f}deg off lane "
+            #                f"(right+) already points to the {action} side > {self.steer_guard.max_heading_deg:.0f}deg")
+            #     continue
 
             if not self.allow_multi_action:
                 other_action = "right" if action == "left" else "left"
@@ -751,29 +781,17 @@ class _BaseOraclePolicy(ActivationPolicy):
             if not self.allow_multi_action:
                 break
 
-        if any(value > 0.0 for value in alpha_vector):
-            return alpha_vector
-
-        for action in ("left", "right"):
-            if self._active_until[self.ACTION_INDEX[action]] != -1:
-                if self._lateral_hold_invalidated(ego, action, data_provider):
-                    self._set_reason(f"release_{action}_hold", f"({self._lane_block or 'lane unavailable'})")
-                    self._active_until[self.ACTION_INDEX[action]] = -1
-                    self._cooldown_until[self.ACTION_INDEX[action]] = -1
-                    self._steer.pop(action, None)
-                    return [0.0, 0.0, 0.0]
-
         for action in ("left", "right"):
             action_index = self.ACTION_INDEX[action]
+            # Newly started maneuvers already passed the lane check above.
+            if alpha_vector[action_index] > 0.0:
+                continue
             if frame <= self._active_until[action_index]:
-                exceeded, angle = self._heading_exceeded(action, ego, data_provider)
-                if exceeded:
-                    # Stop steering.  _cooldown_until is kept on purpose so the (still active)
-                    # trigger cannot restart the steer on the very next frame.
+                if self._lateral_hold_invalidated(ego, action, data_provider):
+                    self._set_reason(f"release_{action}_hold", f"({self._lane_block or 'lane unavailable'})")
                     self._active_until[action_index] = -1
+                    self._cooldown_until[action_index] = -1
                     self._steer.pop(action, None)
-                    self._set_reason(f"stop_{action}_heading",
-                                     f"heading={angle:+.1f}deg > {self.steer_guard.max_heading_deg:.0f}deg toward {action}")
                     continue
                 alpha_vector[action_index] = self._steer_alpha(action, ego, frame)
                 self._set_reason(
@@ -801,16 +819,16 @@ class _BaseOraclePolicy(ActivationPolicy):
         # CARLA is left-handed (+y is right): positive cross = ego rotated to the right.
         return math.degrees(math.atan2(lx * ego_f.y - ly * ego_f.x, lx * ego_f.x + ly * ego_f.y))
 
-    def _heading_exceeded(self, action: str, ego, data_provider) -> tuple[bool, float | None]:
-        """(True, angle) if the ego is > max_heading_deg off the lane toward the ``action`` side."""
-        limit = self.steer_guard.max_heading_deg
-        if limit <= 0.0:
-            return False, None
-        angle = self._heading_vs_lane_deg(ego, data_provider)
-        if angle is None:
-            return False, None
-        toward = angle if action == "right" else -angle
-        return toward > limit, angle
+    # def _heading_exceeded(self, action: str, ego, data_provider) -> tuple[bool, float | None]:
+    #     """(True, angle) if the ego is > max_heading_deg off the lane toward the ``action`` side."""
+    #     limit = self.steer_guard.max_heading_deg
+    #     if limit <= 0.0:
+    #         return False, None
+    #     angle = self._heading_vs_lane_deg(ego, data_provider)
+    #     if angle is None:
+    #         return False, None
+    #     toward = angle if action == "right" else -angle
+    #     return toward > limit, angle
 
     def _steer_begin(self, action: str, ego, frame: int) -> float:
         """Anchor the stall detector at the current pose; returns the initial alpha."""
@@ -970,13 +988,188 @@ class _BaseOraclePolicy(ActivationPolicy):
             return True
         return False
 
+    APPROACH_LATERAL_SPEED = 0.05   # m/s perpendicular to the ego heading, toward the ego path
+    APPROACH_MARGIN_SCALE = 2.0     # brake_hazard lateral margin multiplier for such actors
+
+    # ---- adjacent-lane encroachment check (replaces the straight-line corridor for adjacent oncoming cars) ----
+    ADJ_ENCROACH_RATIO = 0.7        # brake-worthy when the used share of the free lateral slack reaches this
+    ADJ_PREDICT_T = 0.5             # s, look-ahead for the actor's lateral drift toward the ego lane
+
+    @staticmethod
+    def _wp_xy_dist(a, b) -> float:
+        return math.hypot(a.x - b.x, a.y - b.y)
+
+    @staticmethod
+    def _half_width(vehicle, default: float = 1.0) -> float:
+        try:
+            return max(float(vehicle.bounding_box.extent.y), 0.3)
+        except Exception:
+            return default
+
+    def _adjacent_lane_encroachment(self, ego, actor, ego_wp, actor_wp):
+        """Lane-frame lateral-conflict test for an actor driving in the lane NEXT to the ego's.
+
+        Measured in lane coordinates, so it does not depend on the ego's heading (a curve or a
+        turn no longer sweeps the neighbouring lane into a straight-line corridor).
+
+            slack     = lane_centre_gap - ego_half_width - actor_half_width      (free room when both are centred)
+            used      = actor_offset_toward_ego_lane (+ predicted drift) + ego_offset_toward_actor_lane
+            ratio     = used / slack          0 = both centred, 1 = boxes touching, <0 = moving apart
+
+        Returns None when the lanes are not adjacent / not comparable (caller keeps the old logic),
+        otherwise (ratio, info).
+        """
+        if ego_wp is None or actor_wp is None:
+            return None
+        if getattr(ego_wp, "is_junction", False) or getattr(actor_wp, "is_junction", False):
+            return None                                  # lane geometry is not meaningful in junctions
+
+        ego_key = (ego_wp.road_id, ego_wp.lane_id)
+        # neighbour of the ACTOR's lane (at the actor's own station) that is the ego's lane
+        nb = None
+        for getter in ("get_left_lane", "get_right_lane"):
+            try:
+                cand = getattr(actor_wp, getter)()
+            except Exception:
+                cand = None
+            if cand is not None and (cand.road_id, cand.lane_id) == ego_key:
+                nb = cand
+                break
+        if nb is None:
+            return None
+
+        a_loc = actor_wp.transform.location
+        n_loc = nb.transform.location
+        gap = self._wp_xy_dist(a_loc, n_loc)             # centre-to-centre distance of the two lanes
+        if gap < 0.5:
+            return None
+        ux, uy = (n_loc.x - a_loc.x) / gap, (n_loc.y - a_loc.y) / gap   # unit vector: actor lane -> ego lane
+
+        actor_loc = actor.get_location()
+        off_a = (actor_loc.x - a_loc.x) * ux + (actor_loc.y - a_loc.y) * uy      # + = toward ego lane
+        v = actor.get_velocity()
+        drift = max(v.x * ux + v.y * uy, 0.0) * self.ADJ_PREDICT_T                # lateral drift toward ego lane
+
+        # ego offset toward the actor's lane, measured at the ego's own station
+        off_e = 0.0
+        actor_key = (actor_wp.road_id, actor_wp.lane_id)
+        for getter in ("get_left_lane", "get_right_lane"):
+            try:
+                cand = getattr(ego_wp, getter)()
+            except Exception:
+                cand = None
+            if cand is not None and (cand.road_id, cand.lane_id) == actor_key:
+                e_loc = ego_wp.transform.location
+                c_loc = cand.transform.location
+                eg = self._wp_xy_dist(e_loc, c_loc)
+                if eg > 0.5:
+                    ex, ey = (c_loc.x - e_loc.x) / eg, (c_loc.y - e_loc.y) / eg
+                    el = ego.get_location()
+                    off_e = (el.x - e_loc.x) * ex + (el.y - e_loc.y) * ey
+                break
+
+        slack = gap - self._half_width(ego) - self._half_width(actor)
+        used = off_a + drift + off_e
+        ratio = 1.0 if slack <= 0.05 else used / slack
+        return ratio, {"gap": gap, "slack": slack, "off_a": off_a, "drift": drift, "off_e": off_e}
+
+    # # ---- crossing / non-parallel conflict model (swept-AABB TTC in the ego frame) ----
+    # CROSS_MIN_ANGLE_DEG = 30.0      # actor velocity must deviate >= this from the ego axis (else old logic is enough)
+    # CROSS_MIN_ACTOR_SPEED = 0.5     # m/s, ignore (almost) static actors here; the old corridor logic handles them
+    # CROSS_MAX_RANGE = 40.0          # m, euclidean pre-filter
+    # CROSS_LON_MARGIN = 0.5          # m, extra clearance along the ego heading
+    # CROSS_LAT_MARGIN = 0.5          # m, extra clearance across the ego heading
+
+    @staticmethod
+    def _axis_window(p: float, v: float, half: float):
+        """Time interval (t_in, t_out) in which |p + v*t| < half, or None if it never happens."""
+        if abs(v) < 1e-6:
+            return (-math.inf, math.inf) if abs(p) < half else None
+        t1 = (-half - p) / v
+        t2 = (half - p) / v
+        return (t1, t2) if t1 < t2 else (t2, t1)
+
+    # def _crossing_ttc(self, ego, actor):
+    #     """Time-to-collision for actors whose path is not parallel to the ego's (e.g. perpendicular).
+
+    #     Everything is expressed in the ego frame (x = forward, y = right) with the ego at the origin.
+    #     The actor is a box moving with constant *relative* velocity (v_actor - v_ego).  The collision
+    #     happens when the x-window and the y-window in which the boxes overlap intersect in time:
+
+    #         TTC = max(t_in_x, t_in_y)   if   max(t_in) < min(t_out) and min(t_out) > 0
+
+    #     Unlike the longitudinal-only TTC, this accounts for *when the actor reaches the ego's path*, so
+    #     it is correct for a fast car arriving from the side (the ego may pass in front of it => no
+    #     conflict) and does not depend on the actor's current lateral offset.
+
+    #     Returns (ttc, info_dict) when a conflict is predicted, otherwise None.
+    #     """
+    #     ego_tf = ego.get_transform()
+    #     ego_loc = ego_tf.location
+    #     f = ego_tf.get_forward_vector()
+    #     r = ego_tf.get_right_vector()
+
+    #     actor_loc = actor.get_location()
+    #     dx, dy = actor_loc.x - ego_loc.x, actor_loc.y - ego_loc.y
+    #     if dx * dx + dy * dy > self.CROSS_MAX_RANGE ** 2:
+    #         return None
+    #     px = dx * f.x + dy * f.y
+    #     py = dx * r.x + dy * r.y
+
+    #     ev, av = ego.get_velocity(), actor.get_velocity()
+    #     a_speed = math.hypot(av.x, av.y)
+    #     if a_speed < self.CROSS_MIN_ACTOR_SPEED:
+    #         return None
+    #     # angle between the actor's *velocity* (works for walkers too) and the ego heading
+    #     cos_v = (av.x * f.x + av.y * f.y) / a_speed
+    #     angle = math.degrees(math.acos(max(-1.0, min(1.0, cos_v))))
+    #     if not (self.CROSS_MIN_ANGLE_DEG <= angle <= 180.0 - self.CROSS_MIN_ANGLE_DEG):
+    #         return None
+
+    #     vx = (av.x - ev.x) * f.x + (av.y - ev.y) * f.y
+    #     vy = (av.x - ev.x) * r.x + (av.y - ev.y) * r.y
+
+    #     def _half_extent(a):
+    #         try:
+    #             e = a.bounding_box.extent
+    #             return max(float(e.x), 0.1), max(float(e.y), 0.1)
+    #         except Exception:
+    #             return 2.25, 1.0
+
+    #     ego_ex, ego_ey = _half_extent(ego)
+    #     act_ex, act_ey = _half_extent(actor)
+    #     # axis-aligned half extents of the actor's box expressed in the ego frame
+    #     a_f = actor.get_transform().get_forward_vector()
+    #     cos_t = a_f.x * f.x + a_f.y * f.y
+    #     sin_t = a_f.x * r.x + a_f.y * r.y
+    #     ax = abs(cos_t) * act_ex + abs(sin_t) * act_ey
+    #     ay = abs(sin_t) * act_ex + abs(cos_t) * act_ey
+
+    #     hx = ego_ex + ax + self.CROSS_LON_MARGIN
+    #     hy = ego_ey + ay + self.CROSS_LAT_MARGIN
+
+    #     wx = self._axis_window(px, vx, hx)
+    #     wy = self._axis_window(py, vy, hy)
+    #     if wx is None or wy is None:
+    #         return None
+    #     t_in = max(wx[0], wy[0], 0.0)
+    #     t_out = min(wx[1], wy[1])
+    #     if t_out <= 0.0 or t_in >= t_out:
+    #         return None
+
+    #     ego_speed = max(ev.x * f.x + ev.y * f.y, 0.0)
+    #     return t_in, {"angle": angle, "px": px, "py": py, "vx": vx, "vy": vy,
+    #                   "t_out": t_out, "ego_speed": ego_speed}
+
     def _scenario_actor_brake_hazard(self, ego, actor) -> bool:
         aid = getattr(actor, "id", None)
-        tag = f"hazard(actor={aid})"
+        tag = f"hazard(actor={aid}, {self._actor_kind(actor)}:{getattr(actor, 'type_id', '?')})"
         ego_transform = ego.get_transform()
         ego_location = ego_transform.location
         forward = ego_transform.get_forward_vector()
         right = ego_transform.get_right_vector()
+
+        lane_conflict = False   # set when an adjacent-lane actor encroaches on the ego lane
 
         # [核心新增] 如果對方是車輛，且與自車「同車道、方向相反(相向)」，直接忽略煞車！
         if getattr(actor, "type_id", "").startswith("vehicle."):
@@ -1001,8 +1194,43 @@ class _BaseOraclePolicy(ActivationPolicy):
                         if same_lane or ego_in_oncoming_lane:
                             self._note(f"{tag} NO: ignored oncoming vehicle in same/borrowed lane")
                             return False
+                        # 3. 相鄰車道的對向車：用「車道座標下的壓線比例」判斷，不用 ego 朝向的直線 corridor
+                        #    (彎道上直線 corridor 會掃到對向車道 -> 誤煞車)
+                        enc = self._adjacent_lane_encroachment(ego, actor, ego_wp, actor_wp)
+                        if enc is not None:
+                            ratio, einfo = enc
+                            detail = (f"ratio={ratio:.2f} (thr={self.ADJ_ENCROACH_RATIO:.2f}) gap={einfo['gap']:.2f} "
+                                      f"slack={einfo['slack']:.2f} off_actor={einfo['off_a']:.2f} "
+                                      f"drift={einfo['drift']:.2f} off_ego={einfo['off_e']:.2f}")
+                            if ratio < self.ADJ_ENCROACH_RATIO:
+                                self._note(f"{tag} NO: adjacent oncoming lane, no encroachment: {detail}")
+                                return False
+                            lane_conflict = True
+                            self._note(f"{tag} adjacent oncoming lane ENCROACHING: {detail}")
             except Exception:
                 pass
+
+        # Non-parallel (e.g. perpendicular / cross-traffic) actors: predict the collision time directly
+        # instead of relying on the current longitudinal/lateral offsets below.
+        try:
+            crossing = self._crossing_ttc(ego, actor)
+        except Exception:
+            crossing = None
+        if crossing is not None:
+            c_ttc, c_info = crossing
+            c_speed = c_info["ego_speed"]
+            c_stop = (c_speed * self.brake_reaction_time +
+                      c_speed ** 2 / (2.0 * self.brake_deceleration) +
+                      self.brake_distance_margin)
+            c_by_ttc = c_ttc <= self.brake_ttc_threshold
+            c_by_dist = c_speed * c_ttc <= c_stop     # cannot stop before the predicted conflict
+            if c_by_ttc or c_by_dist:
+                self._note(f"{tag} YES(crossing): angle={c_info['angle']:.0f}deg ttc={c_ttc:.2f} "
+                           f"rel_pos=({c_info['px']:.1f},{c_info['py']:.1f}) "
+                           f"rel_vel=({c_info['vx']:.1f},{c_info['vy']:.1f}) "
+                           f"ego_dist={c_speed * c_ttc:.1f} stop_dist={c_stop:.1f}")
+                return True
+            self._note(f"{tag} crossing ttc={c_ttc:.2f} > {self.brake_ttc_threshold:.2f}, no brake yet")
 
         actor_location = actor.get_location()
         diff_x = actor_location.x - ego_location.x
@@ -1013,7 +1241,8 @@ class _BaseOraclePolicy(ActivationPolicy):
                        f"[{self.min_distance:.1f}, {self.brake_hazard_distance:.1f}]")
             return False
 
-        lateral = abs(diff_x * right.x + diff_y * right.y)
+        lateral_signed = diff_x * right.x + diff_y * right.y   # + = actor is on the ego's right
+        lateral = abs(lateral_signed)
         # if lateral > self.brake_hazard_lateral_margin:
         #     self._note(f"{tag} NO: lateral={lateral:.2f} > margin={self.brake_hazard_lateral_margin:.2f}")
         #     return False
@@ -1022,15 +1251,25 @@ class _BaseOraclePolicy(ActivationPolicy):
         if any(self._active_until[self.ACTION_INDEX[a]] >= 0 for a in ("left", "right")):
             lateral_margin = min(lateral_margin, 1.3)
 
-        ego_velocity = ego.get_velocity()
+        # An actor that is moving toward the ego's path (speed perpendicular to the ego
+        # heading, directed at the ego's centre line) will be inside the corridor by the time
+        # the ego gets there, so its current lateral offset under-states the risk: widen the
+        # margin.  (Typical case: a pedestrian starting to cross.)
         actor_velocity = actor.get_velocity()
+        lateral_speed = actor_velocity.x * right.x + actor_velocity.y * right.y      # + = toward ego's right
+        approach_speed = -lateral_speed if lateral_signed >= 0.0 else lateral_speed    # > 0 = toward the ego path
+        if approach_speed > self.APPROACH_LATERAL_SPEED:
+            widened = lateral_margin * self.APPROACH_MARGIN_SCALE
+            if lateral > lateral_margin:
+                self._note(f"{tag} lateral margin {lateral_margin:.2f} -> {widened:.2f}: actor moving toward the "
+                           f"ego path at {approach_speed:.2f}m/s (lateral={lateral:.2f})")
+            lateral_margin = widened
 
-        # TODO
-
-        if lateral > lateral_margin:
+        if lateral > lateral_margin and not lane_conflict:
             self._note(f"{tag} NO: lateral={lateral:.2f} > margin={lateral_margin:.2f}")
             return False
 
+        ego_velocity = ego.get_velocity()
         ego_forward_speed = ego_velocity.x * forward.x + ego_velocity.y * forward.y
         actor_forward_speed = actor_velocity.x * \
             forward.x + actor_velocity.y * forward.y
@@ -1177,6 +1416,8 @@ class PDMOraclePolicy(_BaseOraclePolicy):
         parking_exit_clear_rear_distance: float = 12.0,
         parking_exit_side_margin: float = 1.0,
         parking_exit_rear_time_gap: float = 3.0,
+        # [NEW] Parking exit only applies when the ego is (nearly) stationary.
+        parking_exit_max_speed: float = 2.5,
         general_brake: bool = False,
         # [NEW] Same-lane check for lateral (left/right) triggers.
         #   "lateral": skip steering if |lateral offset| > same_lane_lateral_margin
@@ -1232,6 +1473,7 @@ class PDMOraclePolicy(_BaseOraclePolicy):
             parking_exit_clear_rear_distance)
         self.parking_exit_side_margin = float(parking_exit_side_margin)
         self.parking_exit_rear_time_gap = float(parking_exit_rear_time_gap)
+        self.parking_exit_max_speed = float(parking_exit_max_speed)
         self.general_brake = bool(general_brake)
         self._two_way_brake_latches: set[Latch] = set()
         # Set each frame the parking-exit clearance check fails, so a held left
@@ -1312,6 +1554,8 @@ class PDMOraclePolicy(_BaseOraclePolicy):
                 "PDM_ORACLE_PARKING_EXIT_SIDE_MARGIN", 1.0)),
             parking_exit_rear_time_gap=float(os.environ.get(
                 "PDM_ORACLE_PARKING_EXIT_REAR_TIME_GAP", 3.0)),
+            parking_exit_max_speed=float(os.environ.get(
+                "PDM_ORACLE_PARKING_EXIT_MAX_SPEED", 1.5)),
             general_brake=_strtobool(
                 os.environ.get("PDM_ORACLE_GENERAL_BRAKE")),
             same_lane_mode=os.environ.get("PDM_ORACLE_SAME_LANE_MODE", "lateral"),
@@ -1414,7 +1658,7 @@ class PDMOraclePolicy(_BaseOraclePolicy):
 
         brake_actor = self._general_brake_actor(ego, CarlaDataProvider)
         if brake_actor is None:
-            self._note("fallback GeneralActorBrake: no vehicle/walker is a brake hazard")
+            self._note("fallback GeneralActorBrake: no vehicle/walker/prop is a brake hazard")
             return triggers
         self._note(f"fallback GeneralActorBrake: actor={getattr(brake_actor, 'id', None)} "
                    f"({getattr(brake_actor, 'type_id', '?')}) is a brake hazard "
@@ -1787,17 +2031,41 @@ class PDMOraclePolicy(_BaseOraclePolicy):
             distance_to_driving_lane = self._horizontal_distance(
                 ego_location, driving_waypoint.transform.location)
 
-        parking_exit_like = (
-            not self._waypoint_is_driving(ego_waypoint) or
-            distance_to_driving_lane > self.parking_exit_distance_to_driving_lane)
+        wp_not_driving = not self._waypoint_is_driving(ego_waypoint)
+        far_from_driving = distance_to_driving_lane > self.parking_exit_distance_to_driving_lane
+        parking_exit_like = wp_not_driving or far_from_driving
         if not parking_exit_like:
             return None
 
+        try:
+            ego_speed = ego.get_velocity().length()
+        except Exception:
+            ego_speed = float("nan")
+        self._note(
+            f"parking_exit: ego wp road={ego_waypoint.road_id} lane={ego_waypoint.lane_id} "
+            f"type={getattr(ego_waypoint, 'lane_type', '?')} | via "
+            f"{'[non-Driving waypoint]' if wp_not_driving else ''}"
+            f"{'[d_to_driving=%.2fm > %.2fm]' % (distance_to_driving_lane, self.parking_exit_distance_to_driving_lane) if far_from_driving else ''} "
+            f"| ego speed={ego_speed:.2f}m/s (gate: <= {self.parking_exit_max_speed:.2f}m/s)")
+
+        # [NEW] Speed gate: a moving ego that merely touches the lane edge / shoulder is not
+        # "parked", so do not start a parking-exit steer.
+        if ego_speed > self.parking_exit_max_speed:
+            self._note(f"parking_exit: skipped, ego speed {ego_speed:.2f}m/s > "
+                       f"{self.parking_exit_max_speed:.2f}m/s (not parked)")
+            return None
+
         target_lane = self._left_driving_lane(ego_waypoint)
+        target_src = "left driving lane"
         if target_lane is None and driving_waypoint is not None:
             target_lane = driving_waypoint
+            target_src = "nearest driving waypoint (no left driving lane found)"
         if target_lane is None:
+            self._note("parking_exit: no target lane -> no trigger")
             return None
+        self._note(f"parking_exit: target lane road={target_lane.road_id} lane={target_lane.lane_id} "
+                   f"type={getattr(target_lane, 'lane_type', '?')} via {target_src}; "
+                   f"only vehicle.* actors are checked by _lane_clear (walkers / props are NOT)")
 
         if not self._lane_clear(
             ego,
@@ -1807,6 +2075,7 @@ class PDMOraclePolicy(_BaseOraclePolicy):
             # rear_distance=self.parking_exit_clear_rear_distance,
         ):
             self._parking_exit_blocked = True
+            self._note(f"parking_exit: left lane NOT clear -> no trigger ({self._lane_block})")
             return None
 
         return ("left", "GeneralParkingExitLeft", None, distance_to_driving_lane)
@@ -2293,8 +2562,40 @@ class PDMOraclePolicy(_BaseOraclePolicy):
 
         return scan("next") or scan("previous")
 
+    # static.prop.* types that are not physical obstacles in the road
+    PROP_IGNORE = ("streetsign", "trafficlight", "streetlight", "light")
+
+    @staticmethod
+    def _actor_kind(actor) -> str:
+        """Classify by CARLA type_id: vehicle / cyclist / walker / prop / other."""
+        t = getattr(actor, "type_id", "")
+        if t.startswith("walker."):
+            return "walker"
+        if t.startswith("vehicle."):
+            try:
+                if int(actor.attributes.get("number_of_wheels", 4)) == 2:
+                    return "cyclist"
+            except Exception:
+                pass
+            return "vehicle"
+        if t.startswith("static.prop."):
+            return "prop"
+        return "other"
+
+    def _prop_actors(self, data_provider):
+        """Static props (cones, barriers, warning signs, ...) spawned by scenarios."""
+        try:
+            world = data_provider.get_world()
+            props = list(world.get_actors().filter("static.prop.*")) if world is not None else []
+        except Exception:
+            return []
+        return [p for p in props
+                if getattr(p, "is_alive", True)
+                and not any(k in getattr(p, "type_id", "") for k in self.PROP_IGNORE)]
+
     def _general_brake_actor(self, ego, data_provider):
-        for actor in self._vehicle_actors(data_provider) + self._walker_actors(data_provider):
+        for actor in (self._vehicle_actors(data_provider) + self._walker_actors(data_provider)
+                      + self._prop_actors(data_provider)):
             if getattr(actor, "id", None) == getattr(ego, "id", None) or not getattr(actor, "is_alive", True):
                 continue
             if self._scenario_actor_brake_hazard(ego, actor):
@@ -2362,7 +2663,7 @@ class NoPolicy(ActivationPolicy):
 
 def policy_from_env(
     vlm_enabled: bool = False,
-    depth_ttc_client: DepthTTCClient | None = None,
+    depth_ttc_client: AsyncDepthTTCClient | None = None,
     training_config=None,
 ) -> ActivationPolicy:
 

@@ -69,7 +69,14 @@ CLASS_PAPER_ORDER = ["Visual-lon", "Visual-lat", "Behavior", "Robustness"]
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # Required:
-    parser.add_argument("results_root", help="Method results root, e.g. /path/to/method_eval")
+    parser.add_argument(
+        "result_dirs",
+        nargs="+",
+        help=(
+            "One or more seed result directories, each containing the result .json files "
+            "directly (not searched recursively), e.g. results/method/{1,2,3}/res"
+        ),
+    )
     # Optional:
     parser.add_argument(
         "--method",
@@ -109,22 +116,35 @@ def build_route_mapping(route_dir: Path) -> dict[int, tuple[str, str]]:
     return mapping
 
 
-def iter_seed_dirs(results_root: Path) -> Iterable[Path]:
-    direct = [
-        p for p in results_root.glob("*.json")
-        if RESULT_FILE_REGEX.match(p.name) or RESULT_FILE_REGEX_ALT.match(p.name)
-    ]
-    if direct:
-        yield results_root
-        return
-    for path in sorted(results_root.iterdir()):
-        if path.is_dir():
-            yield path
+def resolve_seed_dirs(result_dirs: list[str]) -> list[tuple[str, Path]]:
+    """Return (seed_label, dir) for each explicitly given directory.
+
+    With several dirs like .../1/res, .../2/res, .../3/res, the shared trailing
+    components ("res") are dropped so the seed labels become 1, 2, 3.
+    """
+    paths = [Path(d).resolve() for d in result_dirs]
+    for original, path in zip(result_dirs, paths):
+        if path.exists() and not path.is_dir():
+            raise SystemExit(f"Not a directory: {original}")
+
+    parts = [list(p.parts) for p in paths]
+    if len(paths) > 1:
+        while all(len(p) > 1 for p in parts) and len({p[-1] for p in parts}) == 1:
+            for p in parts:
+                p.pop()
+    labels = [p[-1] for p in parts]
+    # A single .../3/res argument should also be labelled seed 3, not "res".
+    labels = [path.parent.name if path.name == "res" and path.parent.name.isdigit() else label
+              for path, label in zip(paths, labels)]
+    if len(set(labels)) != len(labels):
+        labels = [str(p) for p in paths]
+    return list(zip(labels, paths))
 
 
 def find_result_files(seed_dir: Path) -> list[Path]:
+    # Non-recursive on purpose: only read result files directly inside the given dir.
     return sorted(
-        p for p in seed_dir.rglob("*.json")
+        p for p in seed_dir.glob("*.json")
         if RESULT_FILE_REGEX.match(p.name) or RESULT_FILE_REGEX_ALT.match(p.name)
     )
 
@@ -148,7 +168,7 @@ def is_success(record: dict) -> bool:
 
 def load_rows(
     method: str,
-    results_root: Path,
+    seed_dirs: list[tuple[str, Path]],
     route_map: dict[int, tuple[str, str]],
  ) -> tuple[pd.DataFrame, list[str], bool]:
     rows: list[dict] = []
@@ -156,12 +176,14 @@ def load_rows(
     strict_failure = False
     expected_route_ids = set(route_map.keys())
 
-    for seed_dir in iter_seed_dirs(results_root):
+    for seed_label, seed_dir in seed_dirs:
+        if not seed_dir.is_dir():
+            warnings.append(f"WARNING: seed {seed_label} directory does not exist: {seed_dir}")
+            strict_failure = True
         json_files = find_result_files(seed_dir)
         if not json_files:
-            warnings.append(f"WARNING: seed {seed_dir.name} has no result files.")
+            warnings.append(f"WARNING: seed {seed_label} has no result files.")
             strict_failure = True
-            continue
 
         seen_route_ids: set[int] = set()
         unmapped_files: list[str] = []
@@ -191,8 +213,6 @@ def load_rows(
                 unmapped_files.append(json_path.name)
                 strict_failure = True
                 continue
-            seen_route_ids.add(route_idx)
-
             split, scenario = route_map[route_idx]
             scores = record.get("scores", {}) or {}
             ds = scores.get("score_composed")
@@ -202,10 +222,11 @@ def load_rows(
                 strict_failure = True
                 continue
 
+            seen_route_ids.add(route_idx)
             rows.append(
                 {
                     "Method": method,
-                    "Seed": seed_dir.name,
+                    "Seed": seed_label,
                     "Split": split,
                     "Scenario": scenario,
                     "Id": f"{route_idx:04d}",
@@ -221,13 +242,13 @@ def load_rows(
             preview = ", ".join(f"{route_id:04d}" for route_id in missing_ids[:10])
             suffix = " ..." if len(missing_ids) > 10 else ""
             warnings.append(
-                f"WARNING: seed {seed_dir.name} is missing {len(missing_ids)} results: {preview}{suffix}"
+                f"WARNING: seed {seed_label} is missing {len(missing_ids)} results: {preview}{suffix}"
             )
         if unmapped_files:
             preview = ", ".join(unmapped_files[:10])
             suffix = " ..." if len(unmapped_files) > 10 else ""
             warnings.append(
-                f"WARNING: seed {seed_dir.name} has {len(unmapped_files)} unmapped result files: {preview}{suffix}"
+                f"WARNING: seed {seed_label} has {len(unmapped_files)} unmapped result files: {preview}{suffix}"
             )
 
     return pd.DataFrame(rows), warnings, strict_failure
@@ -434,13 +455,20 @@ def build_latex_row(table: pd.DataFrame, method: str, b2d_score: Optional[float]
 
 def main() -> None:
     args = parse_args()
-    results_root = Path(args.results_root)
+    seed_dirs = resolve_seed_dirs(args.result_dirs)
     route_map = build_route_mapping(Path(args.route_dir))
-    rows, warnings, strict_failure = load_rows(args.method, results_root, route_map)
+    rows, warnings, strict_failure = load_rows(args.method, seed_dirs, route_map)
     table = build_main_table(rows)
 
     if rows.empty:
-        raise SystemExit("No valid rows found.")
+        print("Parsed rows: 0")
+        print(f"Requested seeds: {', '.join(label for label, _ in seed_dirs)}")
+        for warning in warnings:
+            print(warning)
+        print("\nSummary:\nNo valid rows found; scores unavailable.")
+        if args.strict:
+            raise SystemExit(1)
+        return
 
     print_hm_overview(
         "Per-Scenario HM Overview (scenario classes)",

@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from depth_ttc_gate import DepthTTCClient
+from depth_ttc_gate import AsyncDepthTTCClient
 from vlm_gate import AsyncVLMGate
 from activation_steering.policy import (
     ActivationPolicy,
@@ -183,7 +183,7 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
             print("[Fail2DriveHiPADAgent] DEPTH_TTC_STEERING:", self.depth_ttc_steering)
             print("[Fail2DriveHiPADAgent] VLM_STEERING:", self.vlm_steering)
             if self.depth_ttc_steering:
-                self.depth_ttc_client = DepthTTCClient.from_env()
+                self.depth_ttc_client = AsyncDepthTTCClient.from_env()
                 print(f"[Fail2DriveHiPADAgent] Depth TTC server: {self.depth_ttc_client.server_url}")
             self.activation_policy = policy_from_env(
                 vlm_enabled=self.vlm_steering,
@@ -1112,6 +1112,8 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
         )
 
     def destroy(self, results=None):
+        if getattr(self, "depth_ttc_client", None) is not None:
+            self.depth_ttc_client.stop()
         if getattr(self, "vlm_gate", None) is not None:
             self.vlm_gate.stop()
         for hook in getattr(self, "_steering_hooks", []):
@@ -1127,6 +1129,15 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
             self._visualize_video()
         finally:
             super().destroy()
+            self._release_gpu()
+
+    def _release_gpu(self):
+        import gc, torch
+        for name in ("model", "feature_collector", "steering_manager", "_steering_vectors"):
+            if hasattr(self, name):
+                setattr(self, name, None)
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def _log_activation_action(self, control):
         if self.activation_action_log is None:

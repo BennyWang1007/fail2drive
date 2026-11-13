@@ -27,7 +27,8 @@ def _strtobool(value) -> bool:
 
 
 class DepthTTCEvaluator:
-    ACTION_ORDER = ("original", "brake", "left", "right")
+    # ACTION_ORDER = ("original", "brake", "left", "right")
+    ACTION_ORDER = ("original", "brake", "right", "left")
     ACTION_RESPONSE = {
         "original": "none",
         "brake": "brake",
@@ -55,7 +56,8 @@ class DepthTTCEvaluator:
             0.0, min(1.0, float(args.ego_mask_bottom_frac)))
         self.ego_mask_center_width_frac = max(
             0.0, min(1.0, float(args.ego_mask_center_width_frac)))
-        self.debug_dir = Path(args.debug_dir) if args.debug_dir else None
+        self.inference_logging = bool(getattr(args, "inference_logging", False))
+        self.debug_dir = Path(args.debug_dir) if self.inference_logging and args.debug_dir else None
         self.debug_save_every = max(1, int(args.debug_save_every))
         self.debug_max_points = max(1, int(args.debug_max_points))
         self.rollout_dt = max(float(args.rollout_dt), 1e-3)
@@ -146,6 +148,14 @@ class DepthTTCEvaluator:
                 trajectory_times = rollout["trajectory_times"]
                 rollout_controls = rollout["controls"]
 
+        radar_list = payload.get("radar")
+        radar_points = None
+        if radar_list is not None and len(radar_list) > 0:
+            radar_points = np.asarray(radar_list, dtype=np.float32)
+            if radar_points.ndim > 2:
+                radar_points = radar_points.reshape(-1, radar_points.shape[-1])
+        self._log_radar_summary(frame_id, radar_points)
+
         scores = {}
         for name in self.ACTION_ORDER:
             trajectory = trajectories.get(name)
@@ -157,6 +167,38 @@ class DepthTTCEvaluator:
                     "reason": "missing trajectory",
                 }
                 continue
+
+            # if name in ("left", "right") and radar_points is not None:
+            #     if self._is_lane_change_hazard(radar_points, side=name):
+            #         scores[name] = {
+            #             "ttc_s": 0.0,
+            #             "score": -1.0,
+            #             "collision": True,
+            #             "reason": f"blind spot radar hazard on {name}",
+            #         }
+            #         continue
+
+            radar_side = name if name in ("left", "right") else None
+            if name == "original":
+                radar_side = self._trajectory_turn_side(trajectory)  # route turn => check that side
+
+            if radar_side is not None:
+                if radar_points is None and self.inference_logging:
+                    print(f"[DepthTTCServer][radar] frame={frame_id} cand={name} side={radar_side} "
+                          f"SKIPPED: no radar data", flush=True)
+                elif radar_points is not None:
+                    hazard, info = self._is_lane_change_hazard(radar_points, side=radar_side)
+                    if self.inference_logging:
+                        print(f"[DepthTTCServer][radar] frame={frame_id} cand={name} side={radar_side} "
+                              f"hazard={hazard} info={info}", flush=True)
+                    if hazard:
+                        scores[name] = {
+                            "ttc_s": 0.0, "score": -1.0, "collision": True,
+                            "reason": f"radar hazard ({info.get('hazard_type')}) on {radar_side}",
+                            "radar_info": info,
+                        }
+                        continue
+
             score = self._score_trajectory(
                 np.asarray(trajectory, dtype=np.float32),
                 points,
@@ -317,6 +359,78 @@ class DepthTTCEvaluator:
             "reason": "corridor overlap",
             "collision_detail": min_detail or {},
         }
+
+    def _is_lane_change_hazard(
+        self, radar_points, side,
+        ttc_threshold_s=3.0, front_blind_dist_m=6.0, rear_blind_dist_m=20.0,
+    ):
+        """Returns (hazard: bool, info: dict). x fwd(+), y right(+), v_rel approach(+)."""
+        info = {"side": side, "n_radar": 0, "n_lat": 0, "n_side_occ": 0,
+                "n_rear_approach": 0, "min_rear_ttc": None, "hazard_type": None}
+        if radar_points is None or len(radar_points) == 0:
+            return False, info
+        if radar_points.ndim != 2 or radar_points.shape[1] < 4:
+            info["hazard_type"] = f"BAD_SHAPE {radar_points.shape}"
+            if self.inference_logging:
+                print(f"[DepthTTCServer][radar] BAD radar shape {radar_points.shape}, need Nx4 [x,y,z,v_rel]", flush=True)
+            return False, info
+
+        x, y, v_rel = radar_points[:, 0], radar_points[:, 1], radar_points[:, 3]
+        info["n_radar"] = int(len(x))
+        if side == "left":
+            lat_mask = (y >= -4.0) & (y <= -1.2)
+        elif side == "right":
+            lat_mask = (y >= 1.2) & (y <= 4.0)
+        else:
+            return False, info
+        info["n_lat"] = int(lat_mask.sum())
+
+        side_occ = lat_mask & (x >= -4.0) & (x <= front_blind_dist_m)
+        info["n_side_occ"] = int(side_occ.sum())
+        if info["n_side_occ"] > 0:
+            info["hazard_type"] = "side_occupancy"
+            i = np.nonzero(side_occ)[0][0]
+            info["example"] = radar_points[i].astype(float).tolist()
+            return True, info
+
+        rear = lat_mask & (x < -4.0) & (x >= -rear_blind_dist_m) & (v_rel > 0.5)
+        info["n_rear_approach"] = int(rear.sum())
+        if info["n_rear_approach"] > 0:
+            ttc = np.abs(x[rear]) / (v_rel[rear] + 1e-4)
+            info["min_rear_ttc"] = float(ttc.min())
+            if ttc.min() < ttc_threshold_s:
+                info["hazard_type"] = "rear_approach"
+                return True, info
+        return False, info
+
+    @staticmethod
+    def _trajectory_turn_side(trajectory, min_lateral_m=1.5):
+        t = np.asarray(trajectory, dtype=np.float32)
+        if t.ndim == 3:
+            t = t[0]
+        if t.ndim != 2 or t.shape[1] < 2 or len(t) == 0:
+            return None
+        y = t[:, 1]
+        peak = y[np.argmax(np.abs(y))]          # y right = +
+        if abs(peak) < min_lateral_m:
+            return None
+        return "right" if peak > 0 else "left"
+
+    def _log_radar_summary(self, frame_id, radar_points):
+        if not self.inference_logging:
+            return
+        if radar_points is None:
+            print(f"[DepthTTCServer][radar] frame={frame_id} radar=None (client did not send radar)", flush=True)
+            return
+        if radar_points.ndim != 2 or radar_points.shape[1] < 4:
+            print(f"[DepthTTCServer][radar] frame={frame_id} BAD shape={radar_points.shape}", flush=True)
+            return
+        x, y, v = radar_points[:, 0], radar_points[:, 1], radar_points[:, 3]
+        print(f"[DepthTTCServer][radar] frame={frame_id} n={len(x)} "
+              f"x=[{x.min():.1f},{x.max():.1f}] y=[{y.min():.1f},{y.max():.1f}] "
+              f"v=[{v.min():.1f},{v.max():.1f}] "
+              f"n_right_lane={(((y>=1.2)&(y<=4.0))).sum()} n_left_lane={(((y>=-4.0)&(y<=-1.2))).sum()} "
+              f"n_behind={(x<-4.0).sum()}", flush=True)
 
     @staticmethod
     def _trajectory_times(trajectory_times, path_len: int, horizon_s: float):
@@ -1000,12 +1114,13 @@ class Handler(BaseHTTPRequestHandler):
             started_at = time.perf_counter()
             result = self.evaluator.score(payload)
             elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-            print(
-                f"[DepthTTCServer] frame={payload.get('frame_id')} "
-                f"selected={result.get('selected_trajectory')} action={result.get('action')} "
-                f"points={result.get('point_count')} elapsed_ms={elapsed_ms:.1f} "
-                f"{result.get('reason', '')}",
-                flush=True)
+            if self.evaluator.inference_logging:
+                print(
+                    f"[DepthTTCServer] frame={payload.get('frame_id')} "
+                    f"selected={result.get('selected_trajectory')} action={result.get('action')} "
+                    f"points={result.get('point_count')} elapsed_ms={elapsed_ms:.1f} "
+                    f"{result.get('reason', '')}",
+                    flush=True)
             self._write_json(result)
         except Exception as exc:  # pylint: disable=broad-except
             self._write_json(
@@ -1014,7 +1129,7 @@ class Handler(BaseHTTPRequestHandler):
                 status=500)
 
     def log_message(self, fmt, *args):
-        if _strtobool(os.environ.get("DEPTH_TTC_SERVER_VERBOSE", "0")):
+        if self.evaluator.inference_logging and _strtobool(os.environ.get("DEPTH_TTC_SERVER_VERBOSE", "0")):
             super().log_message(fmt, *args)
 
     def _write_json(self, payload: dict, status: int = 200):
@@ -1080,6 +1195,8 @@ def parse_args():
         os.environ.get("DEPTH_TTC_EGO_MASK_CENTER_WIDTH_FRAC", 0.26)))
     parser.add_argument(
         "--debug-dir", default=os.environ.get("DEPTH_TTC_DEBUG_DIR", ""))
+    parser.add_argument("--inference-logging", action="store_true",
+                        help="Opt in to per-request logs and debug artifacts; disabled by default")
     parser.add_argument("--debug-save-every", type=int,
                         default=int(os.environ.get("DEPTH_TTC_DEBUG_SAVE_EVERY", 1)))
     parser.add_argument("--debug-max-points", type=int,
