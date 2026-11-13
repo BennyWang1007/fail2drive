@@ -182,8 +182,8 @@ def result_is_done(result_file: Path) -> bool:
     return not any(record.get("status") in RETRYABLE_STATUSES for record in records)
 
 
-def remove_incomplete_result(result_file: Path) -> None:
-    if not result_file.exists() or result_is_done(result_file):
+def remove_incomplete_result(result_file: Path, force: bool = False) -> None:
+    if not result_file.exists() or (not force and result_is_done(result_file)):
         return
     try:
         result_file.unlink()
@@ -320,9 +320,13 @@ def start_carla(args: argparse.Namespace) -> subprocess.Popen:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    time.sleep(args.carla_startup_wait)
-    if process.poll() is not None:
-        raise RuntimeError(f"CARLA exited during startup with code {process.returncode}")
+    try:
+        time.sleep(args.carla_startup_wait)
+        if process.poll() is not None:
+            raise RuntimeError(f"CARLA exited during startup with code {process.returncode}")
+    except BaseException:
+        stop_carla(process, args)
+        raise
     return process
 
 
@@ -387,6 +391,11 @@ def run_route(args: argparse.Namespace, route: Path, seed: int, attempt: int) ->
         f"--traffic-manager-seed={route_seed}",
     ]
 
+    route_env = os.environ.copy()
+    viz_path = (base_dir / "viz" / route_id).resolve()
+    viz_path.mkdir(parents=True, exist_ok=True)
+    route_env.update({"VIZ_PATH": str(viz_path), "SAVE_PATH": str(viz_path),
+                      "VISUAL_OUTPUT_PATH": str(viz_path), "BENCHMARK_ROUTE_ID": route_id})
     with out_file.open("a", encoding="utf-8") as stdout, err_file.open("a", encoding="utf-8") as stderr:
         stdout.write(f"\n[local_evaluate] attempt={attempt} seed={seed} route={route.name}\n")
         stdout.write(f"[local_evaluate] command={tee_command(command)}\n")
@@ -395,6 +404,7 @@ def run_route(args: argparse.Namespace, route: Path, seed: int, attempt: int) ->
             command,
             stdout=stdout,
             stderr=stderr,
+            env=route_env,
             start_new_session=True,
         )
         wall_deadline = None
@@ -402,44 +412,46 @@ def run_route(args: argparse.Namespace, route: Path, seed: int, attempt: int) ->
             wall_deadline = time.monotonic() + args.evaluator_wall_timeout
         fatal_seen_at = None
 
-        while True:
-            if process.poll() is not None:
-                return process.returncode
+        try:
+            while True:
+                if process.poll() is not None:
+                    return process.returncode
 
-            now = time.monotonic()
-            if wall_deadline is not None and now >= wall_deadline:
-                return stop_process_group(
-                    process,
-                    stdout,
-                    f"evaluator timed out after {args.evaluator_wall_timeout:.1f}s",
-                )
+                now = time.monotonic()
+                if wall_deadline is not None and now >= wall_deadline:
+                    return stop_process_group(
+                        process, stdout,
+                        f"evaluator timed out after {args.evaluator_wall_timeout:.1f}s")
 
-            if fatal_seen_at is None and log_contains_any(
-                (out_file, err_file),
-                FATAL_EVALUATOR_LOG_PATTERNS,
-            ):
-                fatal_seen_at = now
-                stdout.write(
-                    "[local_evaluate] detected fatal evaluator timeout in logs; "
-                    f"waiting {args.evaluator_fatal_grace:.1f}s for clean exit\n"
-                )
-                stdout.flush()
+                if fatal_seen_at is None and log_contains_any(
+                    (out_file, err_file), FATAL_EVALUATOR_LOG_PATTERNS):
+                    fatal_seen_at = now
+                    stdout.write(
+                        "[local_evaluate] detected fatal evaluator timeout in logs; "
+                        f"waiting {args.evaluator_fatal_grace:.1f}s for clean exit\n")
+                    stdout.flush()
 
-            if fatal_seen_at is not None and now - fatal_seen_at >= args.evaluator_fatal_grace:
-                return stop_process_group(
-                    process,
-                    stdout,
-                    "evaluator did not exit after fatal timeout",
-                )
-
-            time.sleep(1.0)
+                if fatal_seen_at is not None and now - fatal_seen_at >= args.evaluator_fatal_grace:
+                    return stop_process_group(
+                        process, stdout,
+                        "evaluator did not exit after fatal timeout")
+                time.sleep(1.0)
+        finally:
+            if process.poll() is None:
+                stop_process_group(process, stdout, "runner interrupted")
 
 
 def main() -> int:
     args = parse_args()
+    # Let the local supervisor terminate us while still cleaning up CARLA and
+    # evaluator sessions, which do not share the supervisor's process group.
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, interrupted)
     routes = route_files(Path(args.routes), args.route_filter, args.route_limit)
     total = len(routes) * len(args.seeds)
     current = 0
+    failed = 0
 
     print(f"Running {len(routes)} routes x {len(args.seeds)} seeds = {total} evaluations")
     if args.restart_carla:
@@ -458,8 +470,7 @@ def main() -> int:
                 continue
 
             for attempt in range(1, args.retries + 1):
-                if attempt > 1 or args.force:
-                    remove_incomplete_result(result_file)
+                remove_incomplete_result(result_file, force=args.force)
                 print(f"[{current}/{total}] run seed={seed} route={route.name} attempt={attempt}")
                 carla_process = None
                 return_code = 1
@@ -481,8 +492,9 @@ def main() -> int:
                 )
             else:
                 print(f"[fail] exhausted retries for seed={seed} route={route.name}")
+                failed += 1
 
-    return 0
+    return int(failed > 0)
 
 
 if __name__ == "__main__":
