@@ -162,6 +162,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Rerun routes even when an existing non-retryable result is present.",
     )
+    parser.add_argument(
+        "--env-cmd", default="",
+        help="Shell snippet run before the evaluator, e.g. 'conda activate hipad && source f2d_env_config.sh && load_f2d_env common hipad oracle debug'",
+    )
     args = parser.parse_args()
     if args.reuse_carla and args.restart_carla:
         parser.error("--reuse-carla and --restart-carla are mutually exclusive")
@@ -500,8 +504,15 @@ def run_route(args: argparse.Namespace, route: Path, seed: int, attempt: int) ->
         stdout.write(f"\n[local_evaluate] attempt={attempt} seed={seed} route={route.name}\n")
         stdout.write(f"[local_evaluate] command={tee_command(command)}\n")
         stdout.flush()
+        if args.env_cmd:
+            inner = " ".join(shlex.quote(str(c)) for c in command[1:])   # 去掉 sys.executable
+            shell_cmd = f"set -e; {args.env_cmd}; exec python -u {inner}"
+            popen_args = ["bash", "-c", shell_cmd]
+        else:
+            popen_args = command
         process = subprocess.Popen(
-            command,
+            # command,
+            popen_args,
             stdout=stdout,
             stderr=stderr,
             env=route_env,

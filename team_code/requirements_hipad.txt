@@ -1,0 +1,40 @@
+# hipad 環境 (Python 3.8) 的補充套件,只放 evaluator / agent 會用到的純 Python 套件。
+# torch、mmcv、numpy、Pillow、opencv 等由 HiP-AD 自己的環境提供,這裡不要碰。
+# 安裝(用目前版本當 constraints,避免誤升降 torch/numpy):
+#   pip freeze --exclude-editable | grep -v ' @ ' > /tmp/hipad_constraints.txt
+#   pip install -r requirements_hipad.txt -c /tmp/hipad_constraints.txt
+
+# --- srunner / leaderboard (evaluator) ---
+py-trees==0.8.3               # 2.x 需要 Python>=3.9 且 API 不相容
+simple_watchdog_timer==0.1.1
+networkx<3.2                  # 3.2 起不支援 Python 3.8
+shapely
+tabulate
+six
+ephem
+pygame
+psutil
+requests
+xmlschema==1.0.18
+dictor
+pexpect
+lxml
+webcolors
+ujson
+jsonpickle
+tqdm
+
+# --- HiP-AD agent (hipad_b2d_agent.py) ---
+scipy>=1.5,<1.9               # hipad 的 numpy 鎖在 1.18.4;scipy 1.9 起要求 numpy>=1.18.5
+                              # 缺 scipy 就是 hipad_b2d_agent 的 fsolve import 錯誤
+pyquaternion
+
+# --- 刻意不放 ---
+# carla                       由 CARLA_ROOT/PythonAPI 的 egg 提供(PYTHONPATH)
+# numpy / torch / mmcv / Pillow / setuptools   hipad 自己有,版本不可動
+# opencv-python-headless      hipad 已有 opencv-python,兩個並存會互相覆蓋
+# accelerate bitsandbytes transformers   VLM 在獨立的 ALPAMAYO_PY server 裡跑
+# timm tensorboard tensorboardX wandb omegaconf   TFv6 / 訓練用
+# pandas scikit-learn scikit-image imgaug h5py gym laspy laszip filterpy
+# rdp pytictoc einops pylint PyQt6      HiP-AD evaluator 路徑沒用到
+# 若執行時某個 import 真的缺,再單獨 pip install 即可。

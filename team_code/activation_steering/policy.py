@@ -510,7 +510,7 @@ class VLMPolicy(ActivationPolicy):
         alpha_vector = [0.0 for _ in self.ACTIONS]
         if vlm_decision is None:
             return alpha_vector
-        if self.ttl_frames > 0 and decision_age_frames is not None and decision_age_frames > self.ttl_frames:
+        if self.ttl_frames > 0 and decision_age_frames is not None and decision_age_frames >= self.ttl_frames:
             return alpha_vector
 
         action = self._decision_action(vlm_decision)

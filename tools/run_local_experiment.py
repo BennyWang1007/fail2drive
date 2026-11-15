@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -22,6 +23,20 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import local_evaluate
 from run_all_evals import MODEL_DEFAULTS, TASKS
+
+
+def model_python(task):
+    model = task["model"]
+    override = os.environ.get(f"F2D_LOCAL_PYTHON_{model.upper()}")
+    if override:
+        return override
+    base = os.environ.get("F2D_CONDA_BASE")
+    if not base and shutil.which("conda"):
+        base = subprocess.check_output(["conda", "info", "--base"], text=True).strip()
+    candidate = Path(base or "") / "envs" / MODEL_DEFAULTS[model]["conda_env"] / "bin/python"
+    if base and candidate.is_file():
+        return str(candidate)
+    raise RuntimeError(f"python for {model} not found; set F2D_LOCAL_PYTHON_{model.upper()}")
 
 
 def catalog():
@@ -198,10 +213,16 @@ def run_task(name, task, seeds, args):
     if args.dry_run:
         # No profile sourcing, cache directories, server processes, or model imports.
         print(f"[dry-run] {name} seeds={','.join(map(str, seeds))} profiles={task['env_mods']}")
-        print(f"  Python={sys.executable}; CARLA={'existing' if args.existing_carla else 'reused' if args.reuse_carla else 'restart per route'}; retries={args.retries}")
+        print(f"  Python={model_python(task)}; CARLA={'existing' if args.existing_carla else 'reused' if args.reuse_carla else 'restart per route'}; retries={args.retries}")
         print(f"  results={args.out_root or 'results/' + Path(task['resolved_out_root']).name}; mode={task.get('eval_mode', 'none')}")
         return 0
     env, server_gpu = task_environment(task)
+    py = model_python(task)
+    env["PATH"] = str(Path(py).parent) + os.pathsep + env.get("PATH", "")
+    env["CONDA_PREFIX"] = str(Path(py).parent.parent)
+    fallback = os.environ.get("F2D_LOCAL_FALLBACK_SITE")   # Optional fallback for site-packages (e.g., for CARLA PythonAPI).
+    if fallback:
+        env["PYTHONPATH"] += os.pathsep + fallback
     command = evaluator_args(name, task, seeds, args, env)
     # Validate route selection before loading any models.
     routes = local_evaluate.route_files(Path(args.routes), args.route_filter, args.route_limit)
@@ -256,7 +277,7 @@ def run_task(name, task, seeds, args):
                 env["ALPAMAYO_SERVER_URL"] = env[key]
             wait_ready(env[key], args.server_startup_timeout, server)
         print(f"[local] {name} seeds={seeds} eval GPU={env['CUDA_VISIBLE_DEVICES']}", flush=True)
-        evaluator = subprocess.Popen([sys.executable, "-u", "local_evaluate.py", *command],
+        evaluator = subprocess.Popen([py, "-u", "local_evaluate.py", *command],
                                      cwd=ROOT, env=env, start_new_session=True)
         while evaluator.poll() is None:
             if server is not None and server.poll() is not None:
