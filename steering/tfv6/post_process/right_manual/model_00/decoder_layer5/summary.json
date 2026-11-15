@@ -1,0 +1,62 @@
+{
+  "adapter": "transfuser_target_speed",
+  "action": "right_change_lane",
+  "positive_label": "right_change_lane",
+  "negative_label": "normal",
+  "positive_count": 5,
+  "negative_count": 3221,
+  "total_rows": 51705,
+  "missing_features": 0,
+  "flatten": false,
+  "vector_formula": "positive_mean - negative_mean",
+  "manual_positive_frames_path": "steering/tfv6/LaneChangeRight/picked_frames_decoder_layer5.json",
+  "manual_positive_frame_count": 5,
+  "manual_negative_frames_path": null,
+  "manual_negative_frame_count": 0,
+  "output_files": {
+    "positive_mean": "steering/tfv6/post_process/right_manual/model_00/decoder_layer5/positive_mean.pt",
+    "negative_mean": "steering/tfv6/post_process/right_manual/model_00/decoder_layer5/negative_mean.pt",
+    "steering_vector": "steering/tfv6/post_process/right_manual/model_00/decoder_layer5/steering_vector.pt",
+    "selected_frames": "steering/tfv6/post_process/right_manual/selected_frames.jsonl"
+  },
+  "args": {
+    "adapter": "transfuser_target_speed",
+    "collection_root": "steering/tfv6",
+    "logs_root": null,
+    "features_root": null,
+    "feature_name": "decoder_layer5",
+    "model_name": "tfv6",
+    "layer_name": null,
+    "output_dir": "steering/tfv6/post_process/right_manual",
+    "folder_name": null,
+    "action": "right_change_lane",
+    "model_index": 0,
+    "max_frames_per_class": 0,
+    "flatten": false,
+    "manual": true,
+    "manual_negative_frames": null,
+    "force": false,
+    "steer_threshold": 0.2,
+    "normal_max_abs_steer": 0.05,
+    "positive_include_pattern": [
+      "Right"
+    ],
+    "positive_exclude_pattern": [],
+    "negative_include_pattern": [
+      "Normal"
+    ],
+    "negative_exclude_pattern": [],
+    "brake_threshold": 0.5,
+    "brake_min_target_speed_drop": 1.0,
+    "brake_min_speed_ratio": 1.1,
+    "brake_min_run_length": 2,
+    "brake_target_speed_state_threshold": null,
+    "normal_throttle_threshold": 0.1,
+    "min_speed": 0.5,
+    "exclude_stop_sign": false,
+    "brake_include_pattern": [],
+    "brake_exclude_pattern": [],
+    "normal_include_pattern": [],
+    "normal_exclude_pattern": []
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "adapter": "hipad_plan",
+  "model_name": "hipad",
+  "action": "brake",
+  "feature_name": "align_query",
+  "layer_name": "layer_02",
+  "model_index": -1,
+  "max_frames_per_class": 0,
+  "flatten": false,
+  "manual": true,
+  "steer_threshold": 0.2,
+  "normal_max_abs_steer": 0.05,
+  "positive_include_pattern": [
+    "Brake"
+  ],
+  "positive_exclude_pattern": [],
+  "negative_include_pattern": [],
+  "negative_exclude_pattern": [],
+  "collection_root": "steering/hipad",
+  "logs_root": null,
+  "features_root": null,
+  "manual_positive_frames_path": "steering/hipad/Brake/picked_frames_align_query.json",
+  "manual_positive_frames_content_hash": "af152609f40b7c119aaf539740723868ab579a68b6174cd5bddb7ddaa6c6fc53",
+  "manual_positive_frames_file_hash": "307d1f2925664aa61019d1acceea623700f5487c67ee85dd676dc03c08e03bb7",
+  "manual_negative_frames_path": "steering/hipad/Brake/manual_negative_frames.json",
+  "manual_negative_frames_content_hash": "95f5c0b10277b5109b6e767b5b670bca6cd2e2b81d77d94e633b264f1ce291d4",
+  "manual_negative_frames_file_hash": "cd4391064dcf3f012d626177d12efcb241b31b1f412d17a7964f1ee777b93559"
+}

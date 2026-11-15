@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "adapter": "hipad_plan",
+  "model_name": "hipad",
+  "action": "left_change_lane",
+  "feature_name": "align_query",
+  "layer_name": "layer_01",
+  "model_index": -1,
+  "max_frames_per_class": 0,
+  "flatten": false,
+  "manual": true,
+  "steer_threshold": 0.2,
+  "normal_max_abs_steer": 0.05,
+  "positive_include_pattern": [
+    "LaneChangeLeft"
+  ],
+  "positive_exclude_pattern": [],
+  "negative_include_pattern": [],
+  "negative_exclude_pattern": [],
+  "collection_root": "steering/hipad",
+  "logs_root": null,
+  "features_root": null,
+  "manual_positive_frames_path": "steering/hipad/LaneChangeLeft/picked_frames_align_query.json",
+  "manual_positive_frames_content_hash": "fbd8c37b9a4231070ab5a5c58c437761db06da24207acaf382369684974ad430",
+  "manual_positive_frames_file_hash": "bbe55dd28a149bab6797c828f59342631663045d167087cb22ca0172fa0ce5ff",
+  "manual_negative_frames_path": "steering/hipad/LaneChangeLeft/manual_negative_frames.json",
+  "manual_negative_frames_content_hash": "5bb540dfb5cd31ace3dd16c60b844311398ab3a34f140fb69edbbf1774ab3820",
+  "manual_negative_frames_file_hash": "da4084b31f6dae5e902cb6c168979741dc7a5d1b3f649a12c1c3a64dc0812f32"
+}

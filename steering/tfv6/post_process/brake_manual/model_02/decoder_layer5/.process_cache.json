@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "adapter": "transfuser_target_speed",
+  "model_name": "tfv6",
+  "action": "brake",
+  "feature_name": "decoder_layer5",
+  "layer_name": null,
+  "model_index": 0,
+  "max_frames_per_class": 0,
+  "flatten": false,
+  "manual": true,
+  "steer_threshold": 0.2,
+  "normal_max_abs_steer": 0.05,
+  "positive_include_pattern": [
+    "Brake"
+  ],
+  "positive_exclude_pattern": [],
+  "negative_include_pattern": [
+    "Normal"
+  ],
+  "negative_exclude_pattern": [],
+  "collection_root": "steering/tfv6",
+  "logs_root": null,
+  "features_root": null,
+  "manual_positive_frames_path": "steering/tfv6/Brake/picked_frames_decoder_layer5.json",
+  "manual_positive_frames_content_hash": "310d3d9ff9667e1726b638e636c06536b8627b0a8a1a8aa4548c483f30b0221d",
+  "manual_positive_frames_file_hash": "385eac21a533b41e6de35732d32125d93cf7c012bbbad0b732a381294c91b3ed",
+  "manual_negative_frames_path": null,
+  "manual_negative_frames_content_hash": null,
+  "manual_negative_frames_file_hash": null
+}

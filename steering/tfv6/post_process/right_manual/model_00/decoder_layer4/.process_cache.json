@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "adapter": "transfuser_target_speed",
+  "model_name": "tfv6",
+  "action": "right_change_lane",
+  "feature_name": "decoder_layer4",
+  "layer_name": null,
+  "model_index": 0,
+  "max_frames_per_class": 0,
+  "flatten": false,
+  "manual": true,
+  "steer_threshold": 0.2,
+  "normal_max_abs_steer": 0.05,
+  "positive_include_pattern": [
+    "Right"
+  ],
+  "positive_exclude_pattern": [],
+  "negative_include_pattern": [
+    "Normal"
+  ],
+  "negative_exclude_pattern": [],
+  "collection_root": "steering/tfv6",
+  "logs_root": null,
+  "features_root": null,
+  "manual_positive_frames_path": "steering/tfv6/LaneChangeRight/picked_frames.json",
+  "manual_positive_frames_content_hash": "b0de16739258db994e69226f343ad1103d47bfd3d5b10aebb5ede069f8a50f96",
+  "manual_positive_frames_file_hash": "f387ef61d37296921eb340853fa84f19b0974a717bc9ed8364de9b33bb6a23e8",
+  "manual_negative_frames_path": null,
+  "manual_negative_frames_content_hash": null,
+  "manual_negative_frames_file_hash": null
+}
