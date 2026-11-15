@@ -994,6 +994,10 @@ if [[ "${{ACTIVATION_POLICY:-}}" == "depth_ttc" || "${{STEERING_POLICY:-}}" == "
   mkdir -p "$DEPTH_TTC_DEBUG_DIR"
 
   DEPTH_LOG="$TEST_OUTPUT/depth_ttc_server.log"
+  DEPTH_LOG_ARGS=()
+  if [[ "${{DEPTH_TTC_INFERENCE_LOGGING:-0}}" == "1" ]]; then
+    DEPTH_LOG_ARGS+=(--inference-logging)
+  fi
   CUDA_VISIBLE_DEVICES="$AUX_GPU" \
     python -u tools/depth_ttc_server.py \
     --host 127.0.0.1 \
@@ -1003,6 +1007,7 @@ if [[ "${{ACTIVATION_POLICY:-}}" == "depth_ttc" || "${{STEERING_POLICY:-}}" == "
     --checkpoint "$DEPTH_CHECKPOINT" \
     --encoder vitl \
     --max-depth 80 \
+    "${{DEPTH_LOG_ARGS[@]}}" \
     >"$DEPTH_LOG" 2>&1 &
   DEPTH_PID=$!
 

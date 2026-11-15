@@ -220,7 +220,8 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
         self.front_traj_vis_only = _env_flag("FRONT_TRAJ_VIS_ONLY", "0")
         if not self.is_visualize:
             self._remove_empty_log_visual_dirs()
-        self.activation_action_log = self.save_path / "activation_actions.jsonl"
+        if os.environ.get("F2D_WORKER_QUIET") != "1":
+            self.activation_action_log = self.save_path / "activation_actions.jsonl"
         self._configure_visual_output_path()
         if not self.legacy_hooks:
             self._setup_feature_collector()  # attach first: its pre-hook sees the un-steered inputs

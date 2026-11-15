@@ -206,10 +206,15 @@ for idx in "\${!GPU_ARRAY[@]}"; do
 
     echo "[Worker \$WORKER_ID] Starting ${STYPE} server on \$NODE_HOST:\$WORKER_PORT (GPU=\$LOCAL_GPU)..."
     if [[ "${STYPE}" == "depth_ttc" ]]; then
-        export DEPTH_TTC_DEBUG_DIR=""
+        DEPTH_TTC_LOG_ARGS=()
+        if [[ "\${DEPTH_TTC_INFERENCE_LOGGING:-0}" == "1" ]]; then
+            export DEPTH_TTC_DEBUG_DIR="\$WORKER_SAVE_DIR/depth_ttc_debug"
+            DEPTH_TTC_LOG_ARGS+=(--inference-logging)
+        fi
         CUDA_VISIBLE_DEVICES="\$LOCAL_GPU" python -u "\$F2D/tools/depth_ttc_server.py" \\
             --host 0.0.0.0 --port "\$WORKER_PORT" --device cuda:0 \\
             --depth-anything-root "\$DEPTH_ROOT" --checkpoint "\$DEPTH_CHECKPOINT" \\
+            "\${DEPTH_TTC_LOG_ARGS[@]}" \\
             >"\$WORKER_LOG" 2>&1 &
     else
         CUDA_VISIBLE_DEVICES="\$LOCAL_GPU" "\$ALPAMAYO_PY" -u "\$F2D/tools/alpamayo_vlm_server.py" \\

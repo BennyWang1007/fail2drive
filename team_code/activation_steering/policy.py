@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Tuple, Union, List
@@ -369,6 +370,17 @@ class DepthTTCPolicy(ActivationPolicy):
             self._last_decision_key = key
             self._decision_start_frame = frame
             self._activate(frame, decision.selected_trajectory)
+            self._log_depth_ttc({
+                "event": "result", "decision_frame": decision.frame_id,
+                "applied_frame": frame, "delay_frames": frame - decision.frame_id,
+                "elapsed_ms": decision.elapsed_ms,
+                "selected_trajectory": decision.selected_trajectory,
+                "action": decision.action, "scores": decision.scores,
+                "reason": decision.reason, "error": decision.error,
+                "active_until": self.active_until,
+                "hold_frames": max(0, self.active_until - frame + 1)
+                if self.active_candidate != "original" else 0,
+            })
         if self.client.verbose and frame <= self.active_until:
             print(f"[DepthTTC] use step={frame} decision_frame={decision.frame_id} "
                   f"age={frame - self._decision_start_frame} "
@@ -402,6 +414,14 @@ class DepthTTCPolicy(ActivationPolicy):
             return
         self.active_candidate = candidate
         self.active_until = frame + getattr(self, f"hold_frames_{candidate}", self.hold_frames) - 1
+
+    @staticmethod
+    def _log_depth_ttc(record: dict) -> None:
+        save_path = os.environ.get("SAVE_PATH")
+        if not save_path:
+            return
+        with open(os.path.join(save_path, "depth_ttc_decisions.jsonl"), "a", encoding="utf-8") as log_file:
+            log_file.write(json.dumps(record, allow_nan=False) + "\n")
 
     def select(self, frame: int, speed: float, candidate_results, image: np.ndarray, input_data: dict | None = None) -> tuple[str, DepthTTCDecision | None]:
         """Submit scoring; keep using the latest held action on current predictions."""
@@ -444,6 +464,12 @@ class DepthTTCPolicy(ActivationPolicy):
             )
             if submitted:
                 self.last_score_frame = frame
+                self._log_depth_ttc({
+                    "event": "submit", "frame": frame, "speed": float(speed),
+                    "image_shape": list(image.shape),
+                    "planner_candidates": planner_candidates,
+                    "selected_while_pending": selected,
+                })
             return selected, self.client.latest()
 
         if should_score and len(candidate_results) > 1:

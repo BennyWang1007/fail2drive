@@ -26,7 +26,7 @@ GRES_MAPPING = {
     # "depth_ttc": "gpu:nvidia_geforce_rtx_4090:2",
 }
 ROUTE_TIME_LIMIT = "4h"
-CARLA_RPC_TIMEOUT = 12600  # Default: 3.5 hours; route wall limit remains 4 hours.
+CARLA_RPC_TIMEOUT = int(os.environ.get("F2D_CARLA_RPC_TIMEOUT", "12600"))  # Per-recovery override; route wall limit remains 4h.
 CARLA_RPC_TIMEOUT_BY_NODE = {
     "cp16": 1200,
 }
@@ -70,12 +70,21 @@ def route_script(
             server_cmd = """export DEPTH_TTC_SERVER_URL="http://127.0.0.1:$FREE_MODEL_PORT/score"
 export DEPTH_TTC_DEBUG_DIR="${DEPTH_TTC_DEBUG_DIR:-$VIZ_PATH/depth_ttc_debug}"
 SERVER_LOG="$VIZ_PATH/depth_ttc_server_${SLURM_JOB_ID:-manual}.log"
+if [ "${F2D_WORKER_QUIET:-0}" = "1" ]; then
+    SERVER_LOG=/dev/null
+    export DEPTH_TTC_DEBUG_DIR=""
+fi
+DEPTH_TTC_LOG_ARGS=()
+if [ "${DEPTH_TTC_INFERENCE_LOGGING:-0}" = "1" ]; then
+    DEPTH_TTC_LOG_ARGS+=(--inference-logging)
+fi
 CUDA_VISIBLE_DEVICES="$SERVER_GPU" setsid python -u "$F2D/tools/depth_ttc_server.py" \
     --host 127.0.0.1 \
     --port "$FREE_MODEL_PORT" \
     --device cuda:0 \
     --depth-anything-root "$DEPTH_ROOT" \
     --checkpoint "$DEPTH_CHECKPOINT" \
+    "${DEPTH_TTC_LOG_ARGS[@]}" \
     >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!"""
         else:  # vlm
@@ -84,6 +93,10 @@ export ALPAMAYO_SERVER_URL="$VLM_SERVER_URL"
 export ALPAMAYO_RAW_LOG_PATH="${ALPAMAYO_RAW_LOG_PATH:-$VIZ_PATH/alpamayo_raw_responses.txt}"
 export ALPAMAYO_INPUT_SAVE_DIR="${ALPAMAYO_INPUT_SAVE_DIR:-$VIZ_PATH/alpamayo_inputs}"
 SERVER_LOG="$VIZ_PATH/alpamayo_server_${SLURM_JOB_ID:-manual}.log"
+if [ "${F2D_WORKER_QUIET:-0}" = "1" ]; then
+    SERVER_LOG=/dev/null
+    export ALPAMAYO_RAW_LOG_PATH="" ALPAMAYO_INPUT_SAVE_DIR=""
+fi
 CUDA_VISIBLE_DEVICES="$SERVER_GPU" setsid "$ALPAMAYO_PY" -u "$F2D/tools/alpamayo_vlm_server.py" \
     --host 127.0.0.1 \
     --port "$FREE_MODEL_PORT" \
@@ -281,6 +294,7 @@ export TM_PORT=$(comm -23 \\
 
 mkdir -p {shlex.quote(log_dir)} || exit 1
 CARLA_LOG={shlex.quote(log_dir)}/carla_${{SLURM_JOB_ID:-manual}}.log
+if [ "${{F2D_WORKER_QUIET:-0}}" = "1" ]; then CARLA_LOG=/dev/null; fi
 {gpu_prefix}setsid "$CARLA_ROOT/CarlaUE4.sh" \\
     -carla-rpc-port="$FREE_WORLD_PORT" \\
     -nosound {render_args} \\
@@ -301,6 +315,8 @@ def bash_file(batch, cfg, world_port, streaming_port, tm_port, model_port):
     # Keep filenames short even when a batch contains 50 routes. The full route
     # list is stored in the script comment below for queue-to-route mapping.
     tag = f"{first['route_id']}_{batch[-1]['route_id']}"
+    if os.environ.get("F2D_BATCH_NAMESPACE"):
+        tag += "_" + os.environ["F2D_BATCH_NAMESPACE"]
     route_ids = ",".join(job["route_id"] for job in batch)
     job_file = os.path.join(base_dir, "run", f"eval_batch_{tag}.sh")
     log_file = os.path.join(base_dir, "out", f"batch_{tag}_out.log")
@@ -344,10 +360,13 @@ batch_exit=0
                           world_port, streaming_port, tm_port)
     for index, job in enumerate(batch, 1):
         body = route_script(job, cfg, model_port, fresh_carla=index == 1)
+        quiet = os.environ.get("F2D_WORKER_QUIET") == "1"
+        route_out = "/dev/null" if quiet else job["log_file"]
+        route_err = "/dev/null" if quiet else job["err_file"]
         delimiter = f"F2D_ROUTE_{index}_SCRIPT"
         script += f"""
 echo "[Batch] Starting route {index}/{len(batch)}: {job['route_id']}"
-timeout --signal=TERM --kill-after=30s {ROUTE_TIME_LIMIT} bash >{shlex.quote(job['log_file'])} 2>{shlex.quote(job['err_file'])} <<'{delimiter}' &
+timeout --signal=TERM --kill-after=30s {ROUTE_TIME_LIMIT} bash >{shlex.quote(route_out)} 2>{shlex.quote(route_err)} <<'{delimiter}' &
 {body}
 {delimiter}
 ROUTE_PID=$!
@@ -378,6 +397,12 @@ def get_running_jobs():
             time.sleep(10)
 
     running = {}
+    if os.environ.get("F2D_IN_ALLOCATION") == "1":
+        # An adopted worker retains its original batch job name. It must not
+        # mistake its own allocation for another worker running these routes.
+        own_job = os.environ.get("SLURM_JOB_ID", "")
+        out = "\n".join(line for line in out.splitlines()
+                        if line.partition("|")[0].strip() != own_job)
     # Exact prefix match, prevent a shorter prefix from matching jobs belonging to a longer prefix
     exact_job_pattern = re.compile(rf"^{re.escape(FAIL2DRIVE_JOB_PREFIX)}\d+_[^_]+$")
     for line in out.splitlines():
@@ -455,6 +480,9 @@ def _retry_reason(evaluation_data):
     for record in records:
         if not isinstance(record, dict):
             return "record is not a dict"
+        scores = record.get("scores") or {}
+        if scores.get("score_composed") is None or scores.get("score_route") is None:
+            return "record scores missing"
         if record.get("status") in RETRYABLE_STATUSES:
             return f"status {record.get('status')!r} is in RETRYABLE_STATUSES"
     return None
@@ -790,6 +818,8 @@ if __name__ == "__main__":
                                 raise RuntimeError("F2D_IN_ALLOCATION requires a Slurm allocation")
                             base_dir = os.path.dirname(os.path.dirname(job_file))
                             tag = f"batch_{batch[0]['route_id']}_{batch[-1]['route_id']}"
+                            if os.environ.get("F2D_BATCH_NAMESPACE"):
+                                tag += "_" + os.environ["F2D_BATCH_NAMESPACE"]
                             with open(os.path.join(base_dir, "out", tag + "_out.log"), "w") as batch_out, \
                                  open(os.path.join(base_dir, "err", tag + "_err.log"), "w") as batch_err:
                                 result = subprocess.run(["bash", job_file], stdout=batch_out, stderr=batch_err)

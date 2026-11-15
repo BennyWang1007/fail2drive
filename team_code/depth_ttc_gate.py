@@ -28,6 +28,7 @@ class DepthTTCDecision:
     raw_response: str = ""
     timestamp: float = 0.0
     error: str = ""
+    elapsed_ms: float = 0.0
 
 
 class DepthTTCClient:
@@ -209,13 +210,14 @@ class AsyncDepthTTCClient(DepthTTCClient):
             decision = self.score(**payload)
         except Exception as exc:
             decision = self._fallback(payload['frame_id'], f"{type(exc).__name__}: {exc}")
+        decision.elapsed_ms = (time.perf_counter() - started) * 1000.0
         with self._lock:
             if not self._closed:
                 self._latest = decision
             self._busy = False
         if self.verbose:
             print(f"[DepthTTCAsync] result decision_frame={decision.frame_id} "
-                  f"elapsed_ms={(time.perf_counter() - started) * 1000:.1f} "
+                  f"elapsed_ms={decision.elapsed_ms:.1f} "
                   f"selected={decision.selected_trajectory} error={decision.error}", flush=True)
 
     def stop(self):

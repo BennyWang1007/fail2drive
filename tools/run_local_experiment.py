@@ -232,7 +232,11 @@ def run_task(name, task, seeds, args):
                                       "--alpamayo-version", env["ALPAMAYO_VERSION"],
                                       "--max-new-tokens", env["ALPAMAYO_MAX_NEW_TOKENS"]]
                 server_command += ["--host", "127.0.0.1", "--port", str(port), "--device", "cuda:0"]
-                server_log = (log_dir / f"{name}_server_{time.time_ns()}.log").open("w")
+                run_id = time.time_ns()
+                if mode == "depth_ttc" and env.get("DEPTH_TTC_INFERENCE_LOGGING", "0").lower() in ("1", "true", "yes", "on"):
+                    env["DEPTH_TTC_DEBUG_DIR"] = env.get("DEPTH_TTC_DEBUG_DIR") or str(log_dir / f"{name}_debug_{run_id}")
+                    server_command += ["--inference-logging", "--debug-dir", env["DEPTH_TTC_DEBUG_DIR"]]
+                server_log = (log_dir / f"{name}_server_{run_id}.log").open("w")
                 print(f"[local] Starting {mode} on GPU {server_gpu}; log={server_log.name}", flush=True)
                 server = subprocess.Popen(server_command, cwd=ROOT,
                                           env={**env, "CUDA_VISIBLE_DEVICES": server_gpu},
