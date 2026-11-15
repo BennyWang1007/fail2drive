@@ -76,6 +76,7 @@ def add_file(archive, file, arcname):
 # COLLECT
 # ============================================================
 
+
 def collect(output_dir, all_mode=False):
 
     result_types = get_result_types(all_mode)
@@ -93,108 +94,130 @@ def collect(output_dir, all_mode=False):
     print(f"Types        : {', '.join(result_types)}")
     print()
 
-    ZIP_FILE.parent.mkdir(parents=True, exist_ok=True)
+    BASE.mkdir(parents=True, exist_ok=True)
 
-    fd, temp_name = tempfile.mkstemp(
-        prefix="results_collected_",
-        suffix=".zip",
+    total_files = 0
+    overwritten_files = 0
+
+    with tempfile.TemporaryDirectory(
+        prefix="results_sync_",
         dir=BASE
-    )
-    os.close(fd)
+    ) as temp:
 
-    temp_zip = Path(temp_name)
+        staging = Path(temp) / "results_collected"
+        staging.mkdir()
 
-    archive_files = 0
-    local_files = 0
+        # ------------------------------------------------
+        # 1. Extract previous ZIP
+        # ------------------------------------------------
 
-    try:
-        with zipfile.ZipFile(
-            temp_zip,
-            "w",
-            compression=zipfile.ZIP_DEFLATED,
-            compresslevel=6
-        ) as output:
+        if ZIP_FILE.is_file():
 
-            # ------------------------------------------------
-            # 1. Copy previous ZIP directly (baseline)
-            # ------------------------------------------------
+            print("=== Extracting previous ZIP ===")
 
-            if ZIP_FILE.is_file():
+            with zipfile.ZipFile(ZIP_FILE, "r") as archive:
 
-                print("=== Merging previous ZIP ===")
+                for info in archive.infolist():
 
-                with zipfile.ZipFile(ZIP_FILE, "r") as previous:
+                    if info.is_dir():
+                        continue
 
-                    for info in previous.infolist():
+                    relative = valid_archive_path(
+                        info.filename, result_types
+                    )
 
-                        if info.is_dir():
-                            continue
+                    if relative is None:
+                        continue
 
-                        relative = valid_archive_path(
-                            info.filename,
-                            result_types
+                    target = staging / relative
+                    target.parent.mkdir(
+                        parents=True, exist_ok=True
+                    )
+
+                    with archive.open(info) as src:
+                        with open(target, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+
+                    total_files += 1
+
+            print(f"  Extracted: {total_files} files")
+
+        # ------------------------------------------------
+        # 2. Copy local files (overwrite existing)
+        # ------------------------------------------------
+
+        print(f"\n=== Merging local {output_dir} ===")
+
+        for experiment in get_experiments(source):
+
+            for seed in SEEDS:
+
+                for result_type in result_types:
+
+                    src = experiment / seed / result_type
+
+                    if not src.is_dir():
+                        continue
+
+                    files = [
+                        p for p in src.rglob("*")
+                        if p.is_file()
+                    ]
+
+                    for file in files:
+
+                        relative = (
+                            Path(experiment.name)
+                            / seed
+                            / result_type
+                            / file.relative_to(src)
                         )
 
-                        if relative is None:
-                            continue
-
-                        arcname = Path("results_collected") / relative
-
-                        output.writestr(
-                            arcname.as_posix(),
-                            previous.read(info)
+                        target = staging / relative
+                        target.parent.mkdir(
+                            parents=True, exist_ok=True
                         )
 
-                        archive_files += 1
+                        if target.exists():
+                            overwritten_files += 1
 
-                print(f"  Imported: {archive_files} files")
+                        shutil.copy2(file, target)
+                        total_files += 1
 
-            # ------------------------------------------------
-            # 2. Add local files (local takes priority)
-            # ------------------------------------------------
+        # ------------------------------------------------
+        # 3. Create new ZIP
+        # ------------------------------------------------
 
-            print(f"\n=== Adding local {output_dir} ===")
+        print("\n=== Creating ZIP ===")
 
-            for experiment in get_experiments(source):
+        temp_zip = BASE / "results_collected.tmp.zip"
 
-                for seed in SEEDS:
+        try:
+            with zipfile.ZipFile(
+                temp_zip,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=6
+            ) as archive:
 
-                    for result_type in result_types:
+                for file in sorted(staging.rglob("*")):
 
-                        directory = (
-                            experiment / seed / result_type
-                        )
+                    if not file.is_file():
+                        continue
 
-                        if not directory.is_dir():
-                            continue
+                    arcname = (
+                        Path("results_collected")
+                        / file.relative_to(staging)
+                    )
 
-                        for file in sorted(directory.rglob("*")):
+                    archive.write(file, arcname)
 
-                            if not file.is_file():
-                                continue
+            # Replace old ZIP only after successful completion.
+            os.replace(temp_zip, ZIP_FILE)
 
-                            relative = (
-                                Path(experiment.name)
-                                / seed
-                                / result_type
-                                / file.relative_to(directory)
-                            )
-
-                            arcname = (
-                                Path("results_collected") / relative
-                            )
-
-                            add_file(output, file, arcname)
-                            local_files += 1
-
-            print(f"  Added: {local_files} local files")
-
-        # Replace old ZIP only after successful completion.
-        os.replace(temp_zip, ZIP_FILE)
-
-    finally:
-        if temp_zip.exists():
-            temp_zip.unlink()
+        finally:
+            if temp_zip.exists():
+                temp_zip.unlink()
 
     # --------------------------------------------------------
     # Summary
@@ -203,13 +226,12 @@ def collect(output_dir, all_mode=False):
     print("\n" + "=" * 60)
     print("COLLECT COMPLETE")
     print("=" * 60)
-    print(f"Previous ZIP files : {archive_files}")
-    print(f"Local files        : {local_files}")
+    print(f"Files processed    : {total_files}")
+    print(f"Overwritten files  : {overwritten_files}")
     print(f"Result types       : {', '.join(result_types)}")
     print(f"Output ZIP         : {ZIP_FILE}")
     print(f"ZIP size           : {ZIP_FILE.stat().st_size / 1024**2:.2f} MB")
     print("=" * 60)
-
 
 # ============================================================
 # UNPACK
