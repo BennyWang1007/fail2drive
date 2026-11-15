@@ -286,6 +286,8 @@ class DepthTTCPolicy(ActivationPolicy):
             "server scoring, and candidate selection",
             flush=True,
         )
+        print(f"[DepthTTCPolicy] hold brake={self.hold_frames_brake} left={self.hold_frames_left} "
+              f"right={self.hold_frames_right} default={self.hold_frames} every_n={self.every_n}", flush=True)
 
     # @staticmethod
     def _candidate_alphas(self) -> list[tuple[str, list[float]]]:

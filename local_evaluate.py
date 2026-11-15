@@ -9,6 +9,7 @@ seed/res, seed/out, seed/err layout consumed by tools/f2d_result_parser.py.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 from pathlib import Path
@@ -23,7 +24,7 @@ from typing import Iterable
 
 RETRYABLE_STATUSES = {
     "Failed - Agent couldn't be set up",
-    "Failed",
+    # "Failed",
     "Failed - Simulation crashed",
     "Failed - Agent crashed",
 }
@@ -80,6 +81,21 @@ def parse_args() -> argparse.Namespace:
         "--restart-carla",
         action="store_true",
         help="Start a fresh CARLA server for every route attempt and stop it afterwards.",
+    )
+    parser.add_argument(
+        "--reuse-carla",
+        action="store_true",
+        help=(
+            "Start CARLA once and reuse it across routes (like slurm_evaluate.py batches). "
+            "Before each route the world is reset with load_world(); CARLA is restarted only "
+            "if it died, the reset failed, or the previous attempt did not finish cleanly."
+        ),
+    )
+    parser.add_argument(
+        "--carla-recycle-every",
+        type=int,
+        default=0,
+        help="With --reuse-carla, restart CARLA after this many routes (0 = never).",
     )
     parser.add_argument(
         "--carla-root",
@@ -146,7 +162,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Rerun routes even when an existing non-retryable result is present.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.reuse_carla and args.restart_carla:
+        parser.error("--reuse-carla and --restart-carla are mutually exclusive")
+    if args.carla_recycle_every < 0:
+        parser.error("--carla-recycle-every must be >= 0")
+    return args
 
 
 def route_files(route_dir: Path, route_filter: str, route_limit: int) -> list[Path]:
@@ -357,6 +378,85 @@ def stop_carla(process: subprocess.Popen, args: argparse.Namespace, timeout: flo
         print(f"[warn] after stopping CARLA: {exc}")
 
 
+RESET_WORLD_CODE = r"""
+import sys
+import xml.etree.ElementTree as ET
+import carla
+
+route_xml, host, port, timeout, fresh = sys.argv[1:6]
+town = ET.parse(route_xml).getroot().find("route").get("town")
+client = carla.Client(host, int(port))
+client.set_timeout(float(timeout))
+if fresh != "1":
+    # A synchronous world left by the previous evaluator would block load_world().
+    world = client.get_world()
+    settings = world.get_settings()
+    if settings.synchronous_mode:
+        settings.synchronous_mode = False
+        settings.fixed_delta_seconds = None
+        world.apply_settings(settings)
+    del world
+client.load_world(town, reset_settings=True)
+print("[reset] loaded", town, flush=True)
+"""
+
+
+class SharedCarla:
+    """One CARLA process reused across routes (mirrors slurm_evaluate.py batches)."""
+
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.process: subprocess.Popen | None = None
+        self.routes_since_start = 0
+        atexit.register(self.stop)
+
+    def stop(self) -> None:
+        if self.process is not None:
+            stop_carla(self.process, self.args)
+            time.sleep(self.args.carla_shutdown_wait)
+            self.process = None
+
+    def _start(self) -> None:
+        self.process = start_carla(self.args)
+        self.routes_since_start = 0
+
+    def _reset(self, route: Path, fresh: bool) -> bool:
+        try:
+            result = subprocess.run(
+                [sys.executable, "-u", "-c", RESET_WORLD_CODE, str(route), self.args.host,
+                 str(self.args.port), str(self.args.timeout), "1" if fresh else "0"],
+                timeout=self.args.timeout + 60,
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                print(result.stdout + result.stderr, flush=True)
+            return result.returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+
+    def prepare(self, route: Path) -> None:
+        """Make sure a healthy CARLA with a freshly loaded world is ready for `route`."""
+        args = self.args
+        if self.process is not None and self.process.poll() is not None:
+            print("[carla] shared CARLA died; restarting")
+            self.stop()
+        elif (self.process is not None and args.carla_recycle_every > 0
+              and self.routes_since_start >= args.carla_recycle_every):
+            print(f"[carla] recycling shared CARLA after {self.routes_since_start} routes")
+            self.stop()
+        fresh = self.process is None
+        if fresh:
+            self._start()
+        if not self._reset(route, fresh):
+            print("[warn] world reset failed; restarting CARLA once")
+            self.stop()
+            self._start()
+            if not self._reset(route, True):
+                self.stop()
+                raise RuntimeError("world reset failed even after restarting CARLA")
+        self.routes_since_start += 1
+
+
 def run_route(args: argparse.Namespace, route: Path, seed: int, attempt: int) -> int:
     route_id = route.stem.rsplit("_", maxsplit=1)[-1]
     route_seed = int(route_id) % 1000 + (10000 * seed)
@@ -454,8 +554,12 @@ def main() -> int:
     failed = 0
 
     print(f"Running {len(routes)} routes x {len(args.seeds)} seeds = {total} evaluations")
+    shared_carla = SharedCarla(args) if args.reuse_carla else None
     if args.restart_carla:
         print("CARLA will be restarted for every route attempt at " f"{args.host}:{args.port}")
+    elif args.reuse_carla:
+        print("One CARLA will be reused across routes at " f"{args.host}:{args.port}"
+              + (f" (recycled every {args.carla_recycle_every} routes)" if args.carla_recycle_every else ""))
     else:
         print("CARLA must already be running and reachable at " f"{args.host}:{args.port}")
 
@@ -477,6 +581,8 @@ def main() -> int:
                 try:
                     if args.restart_carla:
                         carla_process = start_carla(args)
+                    elif shared_carla is not None:
+                        shared_carla.prepare(route)
                     return_code = run_route(args, route, seed, attempt)
                 except RuntimeError as exc:
                     print(f"[warn] CARLA failed to start for seed={seed} route={route.name}: {exc}")
@@ -486,6 +592,9 @@ def main() -> int:
                         time.sleep(args.carla_shutdown_wait)
                 if result_is_done(result_file):
                     break
+                if shared_carla is not None:
+                    # Do not trust shared server state after an unclean attempt.
+                    shared_carla.stop()
                 print(
                     f"[warn] route did not finish cleanly "
                     f"(returncode={return_code}, result={result_file})"

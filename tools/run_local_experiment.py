@@ -55,9 +55,17 @@ def parse_args(argv=None):
     parser.add_argument("--carla-startup-wait", type=float, default=60)
     parser.add_argument("--existing-carla", action="store_true",
                         help="Use an already running CARLA instead of managing it")
+    parser.add_argument("--reuse-carla", action="store_true",
+                        help="Start CARLA once and reuse it for all routes (world reset per route)")
+    parser.add_argument("--carla-recycle-every", type=int, default=0,
+                        help="With --reuse-carla, restart CARLA every N routes (0 = never)")
     parser.add_argument("--graphics-adapter", default=os.environ.get("CARLA_GRAPHICS_ADAPTER", "0"))
     parser.add_argument("--server-startup-timeout", type=float, default=900)
     args = parser.parse_args(argv)
+    if args.reuse_carla and args.existing_carla:
+        parser.error("--reuse-carla and --existing-carla are mutually exclusive")
+    if args.carla_recycle_every < 0:
+        parser.error("--carla-recycle-every must be >= 0")
     choices = catalog()
     if args.list:
         if args.experiment:
@@ -148,7 +156,9 @@ def evaluator_args(name, task, seeds, args, env):
                "--carla-root", env["CARLA_ROOT"],
                "--graphics-adapter", args.graphics_adapter,
                "--route-filter", args.route_filter, "--route-limit", str(args.route_limit)]
-    if not args.existing_carla:
+    if args.reuse_carla:
+        command += ["--reuse-carla", "--carla-recycle-every", str(args.carla_recycle_every)]
+    elif not args.existing_carla:
         command.append("--restart-carla")
     if args.force:
         command.append("--force")
@@ -188,7 +198,7 @@ def run_task(name, task, seeds, args):
     if args.dry_run:
         # No profile sourcing, cache directories, server processes, or model imports.
         print(f"[dry-run] {name} seeds={','.join(map(str, seeds))} profiles={task['env_mods']}")
-        print(f"  Python={sys.executable}; CARLA={'existing' if args.existing_carla else 'restart per route'}; retries={args.retries}")
+        print(f"  Python={sys.executable}; CARLA={'existing' if args.existing_carla else 'reused' if args.reuse_carla else 'restart per route'}; retries={args.retries}")
         print(f"  results={args.out_root or 'results/' + Path(task['resolved_out_root']).name}; mode={task.get('eval_mode', 'none')}")
         return 0
     env, server_gpu = task_environment(task)
