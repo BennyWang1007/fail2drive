@@ -50,8 +50,8 @@ def main():
         raise SystemExit("No experiment catalog entries found")
     experiments = [(name, seeds.split(",")) for name, seeds in catalog]
     # Include reproduction baselines alongside the submission catalog.
-    experiments.extend((name, ["1", "2", "3"]) for name in
-                       ("tfv6_no_policy", "hipad_no_policy") if name not in dict(catalog))
+    # experiments.extend((name, ["1", "2", "3"]) for name in
+    #                    ("tfv6_no_policy", "hipad_no_policy") if name not in dict(catalog))
     route_map = build_route_mapping(ROOT / "fail2drive_split")
     expected_ids = {f"{idx:04d}" for idx in route_map}
     blocks = []

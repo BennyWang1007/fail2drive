@@ -208,15 +208,28 @@ class DepthTTCEvaluator:
                 trajectory_times=trajectory_times.get(name))
             scores[name] = score
 
-        selected = self._select(scores)
+        # The two-second control rollout can stop short of a nearby wall when
+        # the car slows down. Check the original planner path independently.
+        raw_original = planner_candidates.get("candidates", planner_candidates).get("original", {})
+        guard = self._raw_path_guard(
+            raw_original.get("checkpoints", []), points,
+            speed=float(payload.get("speed", 0.0)),
+            half_width=half_width, half_length=half_length)
+        if guard is not None:
+            scores["original"]["raw_path_guard"] = guard
+        selected = "brake" if guard is not None and "brake" in trajectories else self._select(scores)
         action = self.ACTION_RESPONSE[selected]
+        reason = self._format_reason(selected, scores)
+        if guard is not None:
+            reason += (f"; raw original path overlap at x={guard['nearest_x_m']:.2f}m"
+                       f" within {guard['lookahead_m']:.2f}m")
         result = {
             "frame_id": frame_id,
             "action": action,
             "selected_trajectory": selected,
             "scores": scores,
             "point_count": int(len(points)),
-            "reason": self._format_reason(selected, scores),
+            "reason": reason,
         }
         debug_path = self._save_debug_artifacts(
             payload=payload,
@@ -359,6 +372,42 @@ class DepthTTCEvaluator:
             "reason": "corridor overlap",
             "collision_detail": min_detail or {},
         }
+
+    def _raw_path_guard(self, checkpoints, points, speed, half_width, half_length):
+        """Find depth points intersecting the near part of the original path."""
+        route = np.asarray(checkpoints, dtype=np.float32)
+        if route.ndim != 2 or route.shape[1] < 2 or not len(route) or not len(points):
+            return None
+        speed = max(0.0, speed)
+        lookahead = min(20.0, max(8.0,
+            speed * 0.5 + speed * speed / (2.0 * self.brake_deceleration) + 2.0))
+        path = np.vstack((np.zeros((1, 2), dtype=np.float32), route[:, :2]))
+        cloud = points[:, :2]
+        traveled = 0.0
+        for p0, p1 in zip(path[:-1], path[1:]):
+            segment = p1 - p0
+            length = float(np.linalg.norm(segment))
+            if length < 1e-3:
+                continue
+            remaining = lookahead - traveled
+            if remaining <= 0:
+                break
+            checked_length = min(length, remaining)
+            tangent = segment / length
+            relative = cloud - p0
+            along = relative @ tangent
+            lateral = np.linalg.norm(relative - along[:, None] * tangent, axis=1)
+            inside = ((along >= -half_length) &
+                      (along <= checked_length + half_length) &
+                      (lateral <= half_width) & (cloud[:, 0] > 0.0))
+            if int(np.count_nonzero(inside)) >= self.min_collision_points:
+                return {
+                    "nearest_x_m": float(np.min(cloud[inside, 0])),
+                    "point_count": int(np.count_nonzero(inside)),
+                    "lookahead_m": lookahead,
+                }
+            traveled += length
+        return None
 
     def _is_lane_change_hazard(
         self, radar_points, side,

@@ -286,8 +286,6 @@ class DepthTTCPolicy(ActivationPolicy):
             "server scoring, and candidate selection",
             flush=True,
         )
-        print(f"[DepthTTCPolicy] hold brake={self.hold_frames_brake} left={self.hold_frames_left} "
-              f"right={self.hold_frames_right} default={self.hold_frames} every_n={self.every_n}", flush=True)
 
     # @staticmethod
     def _candidate_alphas(self) -> list[tuple[str, list[float]]]:
@@ -339,7 +337,7 @@ class DepthTTCPolicy(ActivationPolicy):
     def should_score(self, frame: int, speed: float) -> bool:
         if self.client.busy:
             return False
-        if float(speed) < float(os.environ.get("DEPTH_TTC_MIN_SPEED_M_S", 0.0)):
+        if max(0.0, float(speed)) < float(os.environ.get("DEPTH_TTC_MIN_SPEED_M_S", 0.0)):
             return False
         return (
             self.last_score_frame is None
