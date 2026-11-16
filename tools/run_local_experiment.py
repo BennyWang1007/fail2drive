@@ -147,8 +147,11 @@ def task_environment(task):
     env.setdefault("IS_BENCH2DRIVE", "0")
     env.setdefault("PLANNER_TYPE", "only_traj")
     visible = [v.strip() for v in env.get("CUDA_VISIBLE_DEVICES", "0").split(",") if v.strip()]
-    env["CUDA_VISIBLE_DEVICES"] = inherited.get("F2D_LOCAL_EVAL_GPU", visible[0] if visible else "0")
-    server_gpu = inherited.get("F2D_LOCAL_SERVER_GPU", visible[1] if len(visible) > 1 else env["CUDA_VISIBLE_DEVICES"])
+    eval_gpu = inherited.get("F2D_LOCAL_EVAL_GPU") or (visible[0] if visible else "0")
+    server_gpu = inherited.get("F2D_LOCAL_SERVER_GPU") or (visible[1] if len(visible) > 1 else eval_gpu)
+    env["CUDA_VISIBLE_DEVICES"] = eval_gpu
+    if not eval_gpu.strip():
+        raise RuntimeError("F2D_LOCAL_EVAL_GPU resolved to an empty value")
     return env, server_gpu
 
 
