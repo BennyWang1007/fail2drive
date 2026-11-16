@@ -220,6 +220,7 @@ class AlpamayoVLM:
                       command=None,
                       target_point=None,
                       image_frame_ids=None) -> dict:
+        print(f"Alpamayo 1.5 decision_mode={self.decision_mode}", flush=True)
         if self.decision_mode in ("native_traj", "native_cot"):
             return self._generate_v15_native_traj(
                 images=images,
@@ -575,12 +576,12 @@ class AlpamayoVLM:
             return {"action": "none", "confidence": 0.0, "reason": reason[:240]}
 
         lowered = response.lower()
+        if re.search(r"\b(stop|brake|yield|emergency brake)\b", lowered):
+            return {"action": "brake", "confidence": 1.0, "reason": response.strip()[:240]}
         if re.search(r"\b(change|move|merge)\s+(to\s+)?(the\s+)?left\b", lowered):
             return {"action": "left", "confidence": 1.0, "reason": response.strip()[:240]}
         if re.search(r"\b(change|move|merge)\s+(to\s+)?(the\s+)?right\b", lowered):
             return {"action": "right", "confidence": 1.0, "reason": response.strip()[:240]}
-        if re.search(r"\b(stop|brake|yield|emergency brake)\b", lowered):
-            return {"action": "brake", "confidence": 1.0, "reason": response.strip()[:240]}
         cleaned = AlpamayoVLM._clean_generated_text(response)
         return {
             "action": "none",
@@ -608,39 +609,67 @@ class AlpamayoVLM:
 
     @staticmethod
     def _parse_v15_answer(response: str) -> dict:
+        print(f"Parsing Alpamayo 1.5 VQA response: {response!r}", flush=True)
         response = AlpamayoVLM._clean_generated_text(response)
-        explicit = AlpamayoVLM._parse_action(response, require_explicit=True)
-        if explicit.get("confidence", 0.0) > 0.0:
-            return explicit
+        # explicit = AlpamayoVLM._parse_action(response, require_explicit=True)
+        # if explicit.get("confidence", 0.0) > 0.0:
+        #     return explicit
 
         lowered = response.lower()
         if not lowered:
-            return {"action": "none", "confidence": 0.0, "reason": "Invalid empty Alpamayo VQA answer"}
+            return {
+                "action": "none",
+                "confidence": 0.0,
+                "reason": "Invalid empty Alpamayo VQA answer"
+            }
 
+        # Explicitly indicates that no actual hazard exists.
         no_hazard_patterns = (
-            r"\bno[,;]?\s+i\s+do\s+not\s+see\s+any\s+hazard\b",
-            r"\bno[,;]?\s+i\s+don't\s+see\s+any\s+hazard\b",
-            r"\bdo\s+not\s+see\s+any\s+hazard\b",
-            r"\bdon't\s+see\s+any\s+hazard\b",
-            r"\bno\s+(?:immediate\s+)?hazard\b",
+            # No hazard / no potential hazard
+            r"\bno[,;]?\s+i\s+do\s+not\s+see\s+any\s+hazards?\b",
+            r"\bno[,;]?\s+i\s+don't\s+see\s+any\s+hazards?\b",
+            r"\bdo\s+not\s+see\s+any\s+hazards?\b",
+            r"\bdon't\s+see\s+any\s+hazards?\b",
+            r"\bno\s+(?:(?:immediate|potential|actual)\s+)?hazards?\b",
+            r"\bno\s+potential\s+hazards?\b",
+            r"\bno\s+specific\s+hazards?\b",
+            r"\bno\s+hazards?\s+(?:can\s+be\s+identified|are\s+identified|are\s+present)\b",
+            r"\b(?:the\s+)?scene\s+does\s+not\s+have\s+any\s+"
+            r"(?:(?:potential|actual|immediate)\s+)?hazards?\b",
+
+            # No obstacles / dangerous situations
             r"\bno\s+(?:obstacles?|dangerous situations?|immediate need)\b",
+
+            # Empty / clear scene
             r"\broad\s+is\s+clear\b",
             r"\bpath\s+is\s+clear\b",
             r"\blane\s+is\s+clear\b",
             r"\bclear\s+ahead\b",
+            r"\bscene\s+is\s+(?:relatively\s+)?empty\b",
             r"\bsafe\s+to\s+continue\b",
+
+            # Continue current behavior
             r"\bcontinue\s+(?:our|my|the)?\s*(?:current\s+)?driving\b",
             r"\bcontinue\s+(?:our|my|the)?\s*(?:current\s+)?driving\s+behavior\b",
             r"\bcontinue\s+driving\s+at\s+(?:our|my|the)?\s*(?:current\s+)?speed\b",
             r"\bcontinue\s+(?:normally|current action|current behavior)\b",
+            r"\bkeep\s+(?:going|driving)\s+at\s+(?:the\s+)?same\s+speed\b",
             r"\bmaintain(?:ing)?\s+(?:a\s+)?safe\s+distance\b",
             r"\bmaintain(?:ing)?\s+(?:their|its|our|my|the)\s+lanes?\b",
             r"\bmaintain(?:ing)?\s+(?:our|my|the)?\s*(?:current\s+)?lane\b",
+
+            # No need for an intervention
             r"\bno\s+(?:immediate\s+)?need\s+for\s+(?:braking|steering|braking or steering)\b",
             r"\bno\s+(?:immediate\s+)?need\s+to\s+(?:brake|steer)\b",
+            r"\bno\s+need\s+for\s+any\s+specific\s+(?:action|maneuver|intervention|response)\b",
         )
+
         if AlpamayoVLM._has_nonnegated_match(lowered, no_hazard_patterns):
-            return {"action": "none", "confidence": 1.0, "reason": response[:240]}
+            return {
+                "action": "none",
+                "confidence": 1.0,
+                "reason": response[:240]
+            }
 
         brake_patterns = (
             r"\b(should|must|need(?:s)? to|best to|important to)\s+(?:slow down|slow|stop|brake|yield|decelerate|reduce speed)\b",
@@ -670,6 +699,15 @@ class AlpamayoVLM:
             return {"action": "brake", "confidence": 0.8, "reason": response[:240]}
         if AlpamayoVLM._has_nonnegated_match(lowered, continue_patterns):
             return {"action": "none", "confidence": 1.0, "reason": response[:240]}
+
+        # Only parse action instructions when no explicit
+        # no-hazard statement has been identified.
+        explicit = AlpamayoVLM._parse_action(
+            response,
+            require_explicit=True
+        )
+        if explicit.get("confidence", 0.0) > 0.0:
+            return explicit
 
         return {
             "action": "none",

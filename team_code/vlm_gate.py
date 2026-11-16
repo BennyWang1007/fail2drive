@@ -878,7 +878,113 @@ class AsyncVLMGate:
 
     @classmethod
     def _text_to_action(cls, text: str) -> str:
-        lowered = text.lower()
+        lowered = text.lower().strip()
+
+        if not lowered:
+            return "none"
+
+        # 1. Explicitly indicates that no actual hazard exists.
+        no_hazard_patterns = (
+            r"\bno[,;]?\s+i\s+do\s+not\s+see\s+any\s+hazards?\b",
+            r"\bno[,;]?\s+i\s+don't\s+see\s+any\s+hazards?\b",
+            r"\bdo\s+not\s+see\s+any\s+hazards?\b",
+            r"\bdon't\s+see\s+any\s+hazards?\b",
+            r"\bno\s+(?:(?:immediate|potential|actual|apparent|visible)\s+)?hazards?\b",
+            r"\bno\s+potential\s+hazards?\b",
+            r"\bno\s+apparent\s+hazards?\b",
+            r"\bno\s+visible\s+hazards?\b",
+            r"\bno\s+specific\s+hazards?\b",
+            r"\bno\s+hazards?\s+(?:can\s+be\s+identified|are\s+identified|are\s+present)\b",
+            r"\b(?:the\s+)?scene\s+does\s+not\s+have\s+any\s+"
+            r"(?:(?:potential|actual|immediate|apparent|visible)\s+)?hazards?\b",
+
+            # No obstacles / dangerous situations
+            r"\bno\s+(?:obstacles?|dangerous situations?|immediate need)\b",
+
+            # Empty / clear scene
+            r"\broad\s+is\s+clear\b",
+            r"\bpath\s+is\s+clear\b",
+            r"\blane\s+is\s+clear\b",
+            r"\bclear\s+ahead\b",
+            r"\bscene\s+is\s+(?:relatively\s+)?empty\b",
+            r"\bsafe\s+to\s+continue\b",
+
+            # No need for intervention
+            r"\bno\s+(?:immediate\s+)?need\s+for\s+(?:braking|steering|braking or steering)\b",
+            r"\bno\s+(?:immediate\s+)?need\s+to\s+(?:brake|steer)\b",
+            r"\bno\s+need\s+for\s+any\s+specific\s+(?:action|maneuver|intervention|response)\b",
+            r"\bno\s+specific\s+action\s+is\s+needed\b",
+        )
+
+        # if cls._has_nonnegated_match(lowered, no_hazard_patterns):
+        #     return "none"
+
+        # 2. Detect braking actions.
+        brake_patterns = (
+            r"\b(should|must|need(?:s)? to|best to|important to)\s+"
+            r"(?:slow down|slow|stop|brake|yield|decelerate|reduce speed)\b",
+            r"\b(slow down|slow|stop|brake|braking|yield|"
+            r"decelerate|reduce speed|slowly approach)\b",
+            r"\b(blocked|blocking|obstructed|obstacle|pedestrian|"
+            r"collision|hazard|unsafe|uncertain)\b",
+        )
+
+        # Explicitly remaining stationary requires braking.
+        stationary_patterns = (
+            r"\b(?:remain|stay|keep)\s+stationary\b",
+            r"\bmaintain\s+(?:a\s+)?stationary\s+position\b",
+        )
+
+        if (
+            cls._has_nonnegated_match(lowered, stationary_patterns)
+            or cls._has_nonnegated_match(lowered, brake_patterns)
+        ):
+            return "brake"
+
+        # # 3. Detect left/right steering actions.
+        # left_patterns = (
+        #     r"\b(should|must|need(?:s)? to|best to)\s+"
+        #     r"(?:steer|move|merge|change lanes?|swerve)\s+"
+        #     r"(to\s+)?(the\s+)?left\b",
+        #     r"\b(steer|move|merge|change lanes?|swerve)\s+"
+        #     r"(to\s+)?(the\s+)?left\b",
+        #     r"\bleft\s+(lane|side)\s+(is\s+)?(clear|safer|available)\b",
+        # )
+
+        # right_patterns = (
+        #     r"\b(should|must|need(?:s)? to|best to)\s+"
+        #     r"(?:steer|move|merge|change lanes?|swerve)\s+"
+        #     r"(to\s+)?(the\s+)?right\b",
+        #     r"\b(steer|move|merge|change lanes?|swerve)\s+"
+        #     r"(to\s+)?(the\s+)?right\b",
+        #     r"\bright\s+(lane|side)\s+(is\s+)?(clear|safer|available)\b",
+        # )
+
+        # has_left = cls._has_nonnegated_match(lowered, left_patterns)
+        # has_right = cls._has_nonnegated_match(lowered, right_patterns)
+
+        # # Conflicting directions: do not guess.
+        # if has_left and has_right:
+        #     return "none"
+
+        # if has_left:
+        #     return "left"
+
+        # if has_right:
+        #     return "right"
+
+        # # 4. Detect continuation / no intervention.
+        # continue_patterns = (
+        #     r"\b(continue normally|continue|proceed|maintain|"
+        #     r"maintaining|keep)\b",
+        #     r"\b(no immediate hazard|no hazard|path is clear|"
+        #     r"lane is clear|clear ahead|no need)\b",
+        # )
+
+        # if cls._has_nonnegated_match(lowered, continue_patterns):
+        #     return "none"
+
+        # 5. Explicit action fields as fallback.
         for pattern in (
             r"\baction\s*[:=]\s*['\"]?([a-zA-Z_ -]+)",
             r"\bcmd\s*[:=]\s*['\"]?([a-zA-Z_ -]+)",
@@ -896,6 +1002,16 @@ class AsyncVLMGate:
         if re.search(r"\b(stop|brake|yield|emergency brake)\b", lowered):
             return "brake"
         return "none"
+
+    @staticmethod
+    def _has_nonnegated_match(text: str, patterns: tuple[str, ...]) -> bool:
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                prefix = text[max(0, match.start() - 32):match.start()]
+                if re.search(r"\b(no|not|never|avoid|don't|do not|without|no need to)\b", prefix):
+                    continue
+                return True
+        return False
 
     @classmethod
     def _command_to_action(cls, command: str) -> str:

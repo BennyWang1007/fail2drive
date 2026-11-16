@@ -23,6 +23,7 @@ webcolors
 ujson
 jsonpickle
 tqdm
+carla==0.9.15
 
 # --- HiP-AD agent (hipad_b2d_agent.py) ---
 scipy>=1.5,<1.9               # hipad 的 numpy 鎖在 1.18.4;scipy 1.9 起要求 numpy>=1.18.5
